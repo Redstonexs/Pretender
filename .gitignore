@@ -1,0 +1,6 @@
+.slim/deepwork/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cortexkit/

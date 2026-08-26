@@ -1,0 +1,24 @@
+"""Shared fixtures for the foundation lane tests."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture
+def sample_config_path() -> Path:
+    return ROOT / "config.example.toml"
+
+
+@pytest.fixture
+def empty_config():
+    from pretender.config import Config
+
+    return Config()

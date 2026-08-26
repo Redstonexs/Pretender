@@ -1,0 +1,155 @@
+# Pretender sample configuration.
+# Every key is optional — an empty TOML boots a working bot from dataclass defaults.
+# Secrets are ${ENV} references only, never literal values.
+
+[bot]
+name = "麦麦"
+identity_file = "prompts/identity.txt"
+prompt_dir = "prompts"
+
+[llm.profiles.planner]
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-chat"
+temperature = 0.7
+max_tokens = 1200
+timeout_s = 45
+
+[llm.profiles.reply]
+model = "deepseek-chat"
+
+[llm.profiles.vision]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "${DASHSCOPE_API_KEY}"
+model = "qwen-vl-max"
+
+[llm.profiles.embed]
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "${SILICONFLOW_API_KEY}"
+model = "BAAI/bge-m3"
+# Explicit model revision — forms the embedding space identity (model@revision)
+# used to match the active embedding generation. A missing revision degrades
+# semantic recall to FTS-only.
+revision = "2024-07"
+
+[gate]
+mode = "reply_necessity"
+threshold = 8
+trigger_score = 80
+frequency = 1.0
+
+[gate.backoff]
+base_s = 15
+cap_s = 300
+start_count = 2
+
+[drift]
+level = "active"
+anchor = "balanced"
+reaction = "natural"
+
+[output]
+pipeline = ["sanitize", "split", "typo"]
+max_split = 3
+typo_rate = 0.03
+
+[adapter]
+name = "onebot"
+
+[adapter.onebot]
+mode = "reverse_ws"
+host = "127.0.0.1"
+port = 3001
+path = "/onebot/v11/ws"
+# Configure NapCat/OneBot to dial this endpoint with
+# ?message_format=array. CQ-string payloads are rejected so @/reply metadata
+# cannot silently disappear before the gate evaluates them.
+# The bot's own account id (optional — the adapter also learns it from every
+# inbound OneBot event).
+self_id = "10001"
+# OneBot v11 Bearer token. ${ENV} reference only — a literal value is a
+# ConfigError at load time. In forward (ws) mode a plaintext ws:// endpoint
+# with a token must be explicitly local-only; use scheme = "wss" for remote.
+# Reverse_ws is loopback-only until TLS support is configured; use a local TLS
+# reverse proxy for remote deployments. Browser Origin upgrades are rejected.
+access_token = "${ONEBOT_ACCESS_TOKEN}"
+# Bounds how many background media downloads/decode tasks run at once.
+media_concurrency = 4
+
+[storage]
+db_path = "data/pretender.db"
+
+# Phase 6 adaptive learner knobs. Disabled by default — an empty TOML boots
+# a working bot with no learner wiring. When enabled, cadence_s/batch_size
+# are the top-level defaults named profiles override; concurrency bounds how
+# many learner runs execute at once and foreground_reserve the slots
+# reserved for foreground (interactive) work (must be strictly below
+# concurrency). No secrets live here.
+[learn]
+enabled = false
+cadence_s = 3600
+batch_size = 1
+concurrency = 1
+foreground_reserve = 0
+
+[learn.profiles.personality]
+cadence_s = 7200
+policy = "nonself"
+
+# Phase 6 P6.5 media catalog knobs. Disabled by default — an empty TOML
+# boots a working bot with no media catalog wiring. When enabled, harvest
+# gates whether group stickers are harvested at all (default False);
+# group_nonself_stickers_only restricts harvesting to non-self stickers in
+# group chats; private chats and images are disabled unless the matching
+# flag is set; candidate_cap bounds pending candidates per chat (1..16);
+# capacity is the approved-asset cap per (chat, kind); cooldown_s is the
+# per-asset cooldown after use; vision_profile names the explicit LLM
+# profile used to describe candidates (must exist under [llm.profiles]).
+# No secrets live here.
+[media]
+enabled = false
+harvest = false
+group_nonself_stickers_only = true
+private_stickers_enabled = false
+private_images_enabled = false
+candidate_cap = 16
+capacity = 32
+cooldown_s = 3600
+# vision_profile = "vision"
+
+[log]
+dir = "logs"
+level = "INFO"
+max_bytes = 10485760
+backup_count = 3
+
+# Phase 6 P6.6 explicit-trust plugins. Disabled by default — an empty TOML
+# boots a working bot with no plugin wiring. Only the EXPLICIT sources below
+# are resolved, once, at startup: no auto-discovery, no hot reload.
+#   - paths: ordered plugin module files. Relative paths resolve against
+#     this config file's directory and must stay INSIDE it (out-of-root and
+#     duplicate paths are rejected at load).
+#   - entry_points: explicit entry-point names in the "pretender.plugins"
+#     group (importlib.metadata). No auto-loading.
+#   - allow_replace: the operator allowlist of protected core names a plugin
+#     may replace (e.g. "sanitize", "reply", "wait", "no_action"). A
+#     protected name is replaceable ONLY when it is on this list.
+#   - hook_timeout_s: bounds every hook invocation.
+# Plugin modules must declare literal ``name`` and ``version`` assignments
+# (or a literal ``manifest = {name = ..., version = ...}``). Their source
+# hash, ordered gate implementation identities, and manifest are recorded in
+# the dispatch ledger; replay fails closed on any change.
+[plugins]
+paths = []
+entry_points = []
+allow_replace = []
+hook_timeout_s = 5.0
+
+[[chats]]
+key = "qq:group:123456"
+gate = { threshold = 12, frequency = 0.6 }
+
+[[chats]]
+key = "qq:private:654321"
+gate = { threshold = 4 }
+cfg_json = { note = "plugin-owned per-chat JSON" }
