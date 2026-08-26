@@ -16,6 +16,7 @@ max_tokens = 1200
 timeout_s = 45
 
 [llm.profiles.reply]
+api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-chat"
 
 [llm.profiles.vision]

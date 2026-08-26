@@ -1,0 +1,20 @@
+services:
+  pretender:
+    image: pretender:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /config
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:-}"
+      SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
+      ONEBOT_ACCESS_TOKEN: "${ONEBOT_ACCESS_TOKEN:-}"
+    volumes:
+      - ./config:/config:ro
+      - ./prompts:/config/prompts:ro
+      - ./data:/config/data
+      - ./logs:/config/logs
+    command: ["run", "--live"]
