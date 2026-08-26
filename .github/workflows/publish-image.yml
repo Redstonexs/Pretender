@@ -4,15 +4,39 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
 
 jobs:
   test:
+    outputs:
+      release_tag: ${{ steps.release-tag.outputs.release_tag }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
+      - name: Validate release tag
+        id: release-tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$RELEASE_TAG" =~ $semver_re ]]; then
+            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          printf 'release_tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.release-tag.outputs.release_tag }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -32,8 +56,33 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Validate release tag
+        id: release-tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.test.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$RELEASE_TAG" =~ $semver_re ]]; then
+            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          stable=true
+          if [[ "$version" == *-* ]]; then
+            stable=false
+          fi
+          {
+            printf 'release_tag=%s\n' "$RELEASE_TAG"
+            printf 'version=%s\n' "$version"
+            printf 'stable=%s\n' "$stable"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.release-tag.outputs.release_tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -52,10 +101,11 @@ jobs:
           images: |
             ghcr.io/${{ github.repository_owner }}/pretender
           flavor: |
-            latest=auto
+            latest=false
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
+            type=raw,value=${{ steps.release-tag.outputs.release_tag }}
+            type=raw,value=${{ steps.release-tag.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.release-tag.outputs.stable == 'true' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
