@@ -43,8 +43,10 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from pretender.app import App, build_replay_gate
 from pretender.config import Config
@@ -159,8 +161,93 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Dry-run by default: the same agent evaluation (when profiles are
         # configured) but with ZERO outbox rows/worker/send.
         app = App.build(cfg, dry_run=True, trace_sink=_print_trace)
-    asyncio.run(app.run())
+    asyncio.run(_run_app_with_sigterm(app))
     return 0
+
+
+async def _run_app_with_sigterm(app: Any) -> None:
+    """Run ``app`` with CLI-owned SIGTERM coordination.
+
+    ``App.run`` cannot protect the initial ``start()`` call with its own
+    ``finally`` block.  Keep shutdown on this task, cancel the run task first,
+    and only then perform the defensive cleanup so the two shutdown paths can
+    never overlap.
+    """
+    loop = asyncio.get_running_loop()
+    terminated = asyncio.Event()
+    sigterm = getattr(signal, "SIGTERM", None)
+    signal_api = getattr(signal, "signal", None)
+    previous_handler = None
+    handler_installed = False
+
+    def _handle_sigterm(_signum: int, _frame: object) -> None:
+        # Signal handlers must not do async work.  In particular, shutdown
+        # must not be started here because App.run may still be shutting down.
+        loop.call_soon_threadsafe(terminated.set)
+
+    if sigterm is not None and callable(signal_api):
+        try:
+            previous_handler = signal_api(sigterm, _handle_sigterm)
+        except (AttributeError, NotImplementedError, OSError, TypeError,
+                ValueError, RuntimeError):
+            # SIGTERM is unavailable on some platforms and signal.signal()
+            # rejects non-main-thread callers.  The CLI remains usable there.
+            pass
+        else:
+            handler_installed = True
+
+    run_task: asyncio.Task[None] | None = None
+    termination_task: asyncio.Task[bool] | None = None
+    try:
+        # Give a handler invoked during registration a chance to set the event
+        # before app.run is even scheduled.  This is also the safe path for a
+        # SIGTERM arriving during the small setup window.
+        await asyncio.sleep(0)
+        if not terminated.is_set():
+            run_task = asyncio.create_task(app.run())
+            termination_task = asyncio.create_task(terminated.wait())
+            done, _ = await asyncio.wait(
+                (run_task, termination_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if run_task in done:
+                # Preserve normal completion and application errors exactly.
+                await run_task
+            else:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    # SIGTERM cancellation is the expected graceful exit.
+                    pass
+    except asyncio.CancelledError:
+        # A cancellation from outside this coordinator (including asyncio's
+        # SIGINT handling) must remain a cancellation, not become success.
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+        if run_task is not None:
+            try:
+                await run_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
+    finally:
+        if termination_task is not None:
+            if not termination_task.done():
+                termination_task.cancel()
+            try:
+                await termination_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            # This is serialized after run_task is terminal (or when SIGTERM
+            # arrived before it was scheduled), covering the start() gap.
+            await app.shutdown()
+        finally:
+            if handler_installed:
+                assert sigterm is not None
+                assert callable(signal_api)
+                signal_api(sigterm, previous_handler)
 
 
 def _require_agent_profiles(cfg: Config) -> None:

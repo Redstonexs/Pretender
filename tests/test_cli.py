@@ -3,10 +3,12 @@ config, plus the SQL-location invariant (the CLI contains no SQL text)."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import io
 import json
 import re
+import signal
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import pretender.__main__ as module_entry
-from pretender.cli import main
+from pretender.cli import _run_app_with_sigterm, main
 from pretender.config import Config
 from pretender.record import Recorder
 from pretender.gate import Gate
@@ -356,6 +358,123 @@ def test_run_live_and_dry_run_are_mutually_exclusive(tmp_path, monkeypatch, caps
     assert exc.value.code == 2  # argparse usage error
     err = capsys.readouterr().err
     assert "not allowed with" in err
+
+
+class _CoordinatorProbeApp:
+    def __init__(self) -> None:
+        self.run_started = asyncio.Event()
+        self.run_cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+        self.shutdown_finished = asyncio.Event()
+        self.shutdown_calls = 0
+        self.order: list[str] = []
+
+    async def run(self) -> None:
+        self.run_started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.run_cancelled.set()
+            raise
+        finally:
+            self.order.append("run-finally")
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self.order.append("shutdown")
+        self.shutdown_finished.set()
+
+
+def _patch_sigterm(monkeypatch, *, previous=None, invoke_on_install=False):
+    """Fake only SIGTERM; leave asyncio.run's SIGINT setup untouched."""
+    import pretender.cli as cli_module
+
+    if previous is None:
+        previous = object()
+    real_signal = cli_module.signal.signal
+    calls = []
+    handlers = []
+
+    def fake_signal(signum, handler):
+        if signum != signal.SIGTERM:
+            return real_signal(signum, handler)
+        calls.append((signum, handler))
+        if not handlers:
+            handlers.append(handler)
+            if invoke_on_install:
+                handler(signum, None)
+        return previous
+
+    monkeypatch.setattr(cli_module.signal, "signal", fake_signal)
+    return previous, calls, handlers
+
+
+def test_run_coordinator_natural_completion(monkeypatch):
+    app = _CoordinatorProbeApp()
+    app.release.set()
+    _patch_sigterm(monkeypatch)
+
+    asyncio.run(_run_app_with_sigterm(app))
+
+    assert app.order == ["run-finally", "shutdown"]
+    assert app.shutdown_calls == 1
+
+
+def test_run_coordinator_sigterm_cancels_then_shuts_down(monkeypatch):
+    app = _CoordinatorProbeApp()
+    _previous, _calls, handlers = _patch_sigterm(monkeypatch)
+
+    async def scenario():
+        coordinator = asyncio.create_task(_run_app_with_sigterm(app))
+        await asyncio.wait_for(app.run_started.wait(), 1)
+        handlers[0](signal.SIGTERM, None)
+        await asyncio.wait_for(coordinator, 1)
+
+    asyncio.run(scenario())
+
+    assert app.run_cancelled.is_set()
+    assert app.order == ["run-finally", "shutdown"]
+    assert app.shutdown_calls == 1
+
+
+def test_run_coordinator_sigterm_before_run_task_starts(monkeypatch):
+    app = _CoordinatorProbeApp()
+    _patch_sigterm(monkeypatch, invoke_on_install=True)
+
+    asyncio.run(_run_app_with_sigterm(app))
+
+    assert not app.run_started.is_set()
+    assert app.shutdown_calls == 1
+
+
+def test_run_coordinator_restores_previous_sigterm_handler(monkeypatch):
+    app = _CoordinatorProbeApp()
+    app.release.set()
+    previous, calls, _handlers = _patch_sigterm(monkeypatch)
+
+    asyncio.run(_run_app_with_sigterm(app))
+
+    assert calls[0][0] == signal.SIGTERM
+    assert callable(calls[0][1])
+    assert calls[-1] == (signal.SIGTERM, previous)
+
+
+def test_run_coordinator_propagates_external_cancellation(monkeypatch):
+    app = _CoordinatorProbeApp()
+    _patch_sigterm(monkeypatch)
+
+    async def scenario():
+        coordinator = asyncio.create_task(_run_app_with_sigterm(app))
+        await asyncio.wait_for(app.run_started.wait(), 1)
+        coordinator.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(coordinator, 1)
+
+    asyncio.run(scenario())
+
+    assert app.run_cancelled.is_set()
+    assert app.order == ["run-finally", "shutdown"]
+    assert app.shutdown_calls == 1
 
 
 def test_run_dry_run_rejects_config_selected_onebot(tmp_path, monkeypatch, capsys):
