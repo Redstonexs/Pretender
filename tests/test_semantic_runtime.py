@@ -19,6 +19,7 @@ from pretender.budget import BudgetConfig, BudgetManager
 from pretender.clock import VirtualClock
 from pretender.config import Config, LLMConfig, LLMProfile
 from pretender.embed import OptionalEmbeddingService
+from pretender.memory import DEFAULT_SOURCE_TAIL
 from pretender.search import MemorySearch
 from pretender.types import (
     ChatKey,
@@ -65,7 +66,7 @@ async def seed_memories(repo, chat_key, texts, prefix="m"):
             ).fetchone()[0]
         )
         batch = await repo.read_memory_source_batch(
-            chat_key, through_msg_id=MessageRowId(max_id), tail=100
+            chat_key, through_msg_id=MessageRowId(max_id), tail=DEFAULT_SOURCE_TAIL
         )
         assert batch is not None
         rec = MemoryRecord(
@@ -97,6 +98,39 @@ def make_worker(repo, embed, *, space_id="e@r1", model="e", revision="r1",
     return SemanticBackfill(
         repo, embed, budget, model=model, revision=revision, space_id=space_id
     )
+
+
+async def wait_for_worker_built(worker, task, *, timeout=5.0):
+    """Wait for readiness with enough state to diagnose a stuck worker."""
+    try:
+        await asyncio.wait_for(worker._built.wait(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        generations = await worker._repo.list_embedding_generations()
+        if task.cancelled():
+            worker_exception = "CancelledError"
+        elif task.done():
+            worker_exception = repr(task.exception())
+        else:
+            worker_exception = None
+        raise AssertionError(
+            "semantic worker did not build within "
+            f"{timeout:.1f}s: "
+            f"queue={list(worker._queue._queue)!r}, "
+            f"queued_chats={sorted(worker._queued)!r}, "
+            "generation_states="
+            f"{[(g.id, g.space_id, g.state) for g in generations]!r}, "
+            f"worker_done={task.done()}, "
+            f"worker_exception={worker_exception}"
+        ) from exc
+
+
+async def cancel_and_await_worker(task):
+    """Always drain a spawned worker, including after a failed wait."""
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def make_app(tmp_path, cfg, embed_service):
@@ -492,16 +526,22 @@ def test_app_startup_backfill_then_semantic_query_works(tmp_path):
         embedder = FixedEmbedder([1.0, 0.0, 0.0])
         embed = OptionalEmbeddingService(embedder, space_id="e@r1")
         app = make_app(tmp_path, cfg, embed)
-        await app.start()
-        # Wait for the background backfill to complete (the generation is
-        # active); the worker task itself never completes (it drains the
-        # enqueue queue), so await the built event instead.
-        assert app._semantic_backfill is not None
-        await app._semantic_backfill._built.wait()
-        assert app.memory_search is not None
-        hits = await app.memory_search.search(CK, "apple", limit=10)
-        await app.shutdown()
-        return hits
+        task = None
+        try:
+            await app.start()
+            # The worker task drains the queue indefinitely; readiness is
+            # signaled separately by the built event.
+            assert app._semantic_backfill is not None
+            task = app._semantic_task
+            assert task is not None
+            await wait_for_worker_built(app._semantic_backfill, task)
+            assert app.memory_search is not None
+            hits = await app.memory_search.search(CK, "apple", limit=10)
+            return hits
+        finally:
+            if task is not None:
+                await cancel_and_await_worker(task)
+            await app.shutdown()
 
     hits = run(scenario())
     assert any(h.source in ("semantic", "hybrid") for h in hits)
@@ -727,10 +767,9 @@ def test_backlog_more_than_one_batch_drains(tmp_path):
         app = make_app(tmp_path, cfg, None)
         await app.db.open()
         await app.repo.upsert_chat(make_identity())
-        # Ingest 150 messages WITHOUT summarizing: the cursor advances but the
-        # memory watermark stays behind -> a backlog larger than one batch
-        # (tail=100).
-        for i in range(150):
+        # Ingest just over one source batch WITHOUT summarizing: the cursor
+        # advances but the memory watermark stays behind.
+        for i in range(DEFAULT_SOURCE_TAIL + 1):
             await app.repo.ingest_message(
                 None,
                 make_message(
@@ -883,7 +922,8 @@ def test_backfill_chat_larger_than_one_page_fully_covers(tmp_path):
     continuation) and activates only after every page is covered."""
     async def scenario():
         _db, repo = await open_repo_with_chat(tmp_path / "t.db")
-        await seed_memories(repo, CK, [f"text {i}" for i in range(300)])
+        page_size = SemanticBackfill._MEMORY_PAGE
+        await seed_memories(repo, CK, [f"text {i}" for i in range(page_size + 1)])
         embed = embed_service([1.0, 0.0, 0.0])
         worker = make_worker(repo, embed)
         # The first round processes ONE page and re-enqueues the chat.
@@ -891,23 +931,21 @@ def test_backfill_chat_larger_than_one_page_fully_covers(tmp_path):
         queued = list(worker._queue._queue)
         # Drain the queue to completion (the worker's own loop).
         task = asyncio.create_task(worker.run())
-        await worker._built.wait()
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        gens = await repo.list_embedding_generations()
-        active = [g for g in gens if g.state == "active"]
-        rows = await repo.list_vectors(CK, "e", active[0].id)
-        await repo.close()
-        return built, queued, active, len(rows)
+            await wait_for_worker_built(worker, task)
+            gens = await repo.list_embedding_generations()
+            active = [g for g in gens if g.state == "active"]
+            rows = await repo.list_vectors(CK, "e", active[0].id)
+            return built, queued, active, len(rows)
+        finally:
+            await cancel_and_await_worker(task)
+            await repo.close()
 
     built, queued, active, n = run(scenario())
     assert built is False  # pending pages: not active after one round
     assert CK in queued  # the chat was re-enqueued for continuation
     assert len(active) == 1  # eventually active
-    assert n == 300  # every page covered
+    assert n == SemanticBackfill._MEMORY_PAGE + 1  # every page covered
 
 
 def test_backfill_pages_interleave_across_chats_fairly(tmp_path):
@@ -915,9 +953,10 @@ def test_backfill_pages_interleave_across_chats_fairly(tmp_path):
     monopolizes the scan — both chats advance one page per round."""
     async def scenario():
         _db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        page_size = SemanticBackfill._MEMORY_PAGE
         await repo.upsert_chat(make_identity(chat_key=str(OTHER)))
-        await seed_memories(repo, CK, [f"ck {i}" for i in range(200)])
-        await seed_memories(repo, OTHER, [f"other {i}" for i in range(200)],
+        await seed_memories(repo, CK, [f"ck {i}" for i in range(page_size + 1)])
+        await seed_memories(repo, OTHER, [f"other {i}" for i in range(page_size + 1)],
                             prefix="o")
         embed = embed_service([1.0, 0.0, 0.0])
         worker = make_worker(repo, embed)
@@ -926,24 +965,23 @@ def test_backfill_pages_interleave_across_chats_fairly(tmp_path):
         queued = set(worker._queued)
         # Drain to completion.
         task = asyncio.create_task(worker.run())
-        await worker._built.wait()
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        gens = await repo.list_embedding_generations()
-        active = [g for g in gens if g.state == "active"]
-        ck_rows = await repo.list_vectors(CK, "e", active[0].id)
-        other_rows = await repo.list_vectors(OTHER, "e", active[0].id)
-        await repo.close()
-        return built, queued, active, len(ck_rows), len(other_rows)
+            await wait_for_worker_built(worker, task)
+            gens = await repo.list_embedding_generations()
+            active = [g for g in gens if g.state == "active"]
+            ck_rows = await repo.list_vectors(CK, "e", active[0].id)
+            other_rows = await repo.list_vectors(OTHER, "e", active[0].id)
+            return built, queued, active, len(ck_rows), len(other_rows)
+        finally:
+            await cancel_and_await_worker(task)
+            await repo.close()
 
     built, queued, active, n_ck, n_other = run(scenario())
     assert built is False  # pending pages after one round
     assert queued == {CK, OTHER}  # both chats advanced one page (fair)
     assert len(active) == 1
-    assert n_ck == 200 and n_other == 200  # every page of every chat covered
+    page_size = SemanticBackfill._MEMORY_PAGE
+    assert n_ck == page_size + 1 and n_other == page_size + 1  # every page covered
 
 
 def test_backfill_cancelled_between_pages_stays_building_and_restart_resumes(tmp_path):
@@ -952,7 +990,8 @@ def test_backfill_cancelled_between_pages_stays_building_and_restart_resumes(tmp
     covers every page."""
     async def scenario():
         _db, repo = await open_repo_with_chat(tmp_path / "t.db")
-        await seed_memories(repo, CK, [f"text {i}" for i in range(300)])
+        page_size = SemanticBackfill._MEMORY_PAGE
+        await seed_memories(repo, CK, [f"text {i}" for i in range(page_size + 1)])
 
         class CancellingEmbedder:
             def __init__(self):
@@ -978,23 +1017,21 @@ def test_backfill_cancelled_between_pages_stays_building_and_restart_resumes(tmp
         embed2 = embed_service([1.0, 0.0, 0.0])
         worker2 = make_worker(repo, embed2)
         task2 = asyncio.create_task(worker2.run())
-        await worker2._built.wait()
-        task2.cancel()
         try:
-            await task2
-        except asyncio.CancelledError:
-            pass
-        gens2 = await repo.list_embedding_generations()
-        active2 = [g for g in gens2 if g.state == "active"]
-        rows = await repo.list_vectors(CK, "e", active2[0].id)
-        await repo.close()
-        return built, building, active, active2, len(rows)
+            await wait_for_worker_built(worker2, task2)
+            gens2 = await repo.list_embedding_generations()
+            active2 = [g for g in gens2 if g.state == "active"]
+            rows = await repo.list_vectors(CK, "e", active2[0].id)
+            return built, building, active, active2, len(rows)
+        finally:
+            await cancel_and_await_worker(task2)
+            await repo.close()
 
     built, building, active, active2, n = run(scenario())
     assert built is False  # cancelled mid-scan
     assert len(building) == 1 and active == []  # literally building
     assert len(active2) == 1 and active2[0].id == building[0].id  # same gen
-    assert n == 300  # restart covered every page
+    assert n == SemanticBackfill._MEMORY_PAGE + 1  # restart covered every page
 
 
 def test_incremental_backfill_pages_large_chat_into_active_generation(tmp_path):
@@ -1003,24 +1040,25 @@ def test_incremental_backfill_pages_large_chat_into_active_generation(tmp_path):
     covered."""
     async def scenario():
         _db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        page_size = SemanticBackfill._MEMORY_PAGE
         await seed_memories(repo, CK, ["apple pie"])
         embed = embed_service([1.0, 0.0, 0.0])
         worker = make_worker(repo, embed)
         assert await worker._full_backfill() is True
         # A large backlog arrives after activation.
-        await seed_memories(repo, CK, [f"late {i}" for i in range(300)],
+        await seed_memories(repo, CK, [f"late {i}" for i in range(page_size + 1)],
                             prefix="late")
         # Drain the enqueued chat in bounded pages (the worker re-enqueues
         # until every page is covered).
         rows = []
-        for _ in range(10):
+        for _ in range(2):
             await worker._backfill_chat(CK)
             gen = await worker._active_generation()
             rows = await repo.list_vectors(CK, "e", gen.id)
-            if len(rows) == 301:
+            if len(rows) == page_size + 2:
                 break
         await repo.close()
         return len(rows)
 
     n = run(scenario())
-    assert n == 301  # the original + every late page covered
+    assert n == SemanticBackfill._MEMORY_PAGE + 2  # original plus every late page

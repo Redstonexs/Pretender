@@ -5,11 +5,26 @@ from __future__ import annotations
 
 import tomllib
 import typing
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
-from pretender.config import Config, LLMProfile, OneBotConfig, RuntimeOverlay, load_config
+from pretender.config import (
+    AgentConfig,
+    BudgetConfig,
+    ChatConfig,
+    ContextConfig,
+    Config,
+    DriftConfig,
+    GateConfig,
+    LearnConfig,
+    MediaConfig,
+    OutputConfig,
+    LLMProfile,
+    OneBotConfig,
+    RuntimeOverlay,
+    load_config,
+)
 from pretender.errors import ConfigError
 
 
@@ -315,6 +330,74 @@ def test_for_chat_merges_override_over_defaults():
     assert chat.gate.mode == "reply_necessity"  # inherited from top level
     assert chat.gate.trigger_score == 80
     assert chat.gate.backoff.base_s == 15.0
+
+
+def test_for_chat_coerces_all_optional_sections_to_frozen_dataclasses():
+    cfg = Config.loads(
+        '[[chats]]\n'
+        'key = "qq:group:typed"\n'
+        '[chats.gate]\nthreshold = 12\n'
+        '[chats.drift]\nlevel = "wild"\n'
+        '[chats.output]\nmax_split = 5\n'
+        '[chats.context]\nmax_context_size = 60\n'
+        '[chats.budget]\ndaily_cap = 50\n'
+        '[chats.agent]\nmax_execution_s = 600\n'
+        '[chats.learn]\nenabled = true\n'
+        '[chats.media]\nenabled = true\n'
+    )
+    override = cfg.chats[0]
+    section_types = (
+        (override.gate, GateConfig),
+        (override.drift, DriftConfig),
+        (override.output, OutputConfig),
+        (override.context, ContextConfig),
+        (override.budget, BudgetConfig),
+        (override.agent, AgentConfig),
+        (override.learn, LearnConfig),
+        (override.media, MediaConfig),
+    )
+    for section, section_type in section_types:
+        assert isinstance(section, section_type)
+        field_name = fields(section_type)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(section, field_name, getattr(section, field_name))
+
+    chat = cfg.for_chat("qq:group:typed")
+    assert isinstance(chat, ChatConfig)
+    for section, section_type in zip(
+        (
+            chat.gate,
+            chat.drift,
+            chat.output,
+            chat.context,
+            chat.budget,
+            chat.agent,
+            chat.learn,
+            chat.media,
+        ),
+        (
+            GateConfig,
+            DriftConfig,
+            OutputConfig,
+            ContextConfig,
+            BudgetConfig,
+            AgentConfig,
+            LearnConfig,
+            MediaConfig,
+        ),
+    ):
+        assert isinstance(section, section_type)
+        field_name = fields(section_type)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(section, field_name, getattr(section, field_name))
+    assert chat.gate.threshold == 12
+    assert chat.drift.level == "wild"
+    assert chat.output.max_split == 5
+    assert chat.context.max_context_size == 60
+    assert chat.budget.daily_cap == 50
+    assert chat.agent.max_execution_s == 600.0
+    assert chat.learn.enabled is True
+    assert chat.media.enabled is True
 
 
 def test_for_chat_without_override_returns_defaults():

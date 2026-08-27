@@ -58,7 +58,7 @@ def test_wheel_contains_typo_frequency_asset(wheel):
 
 def test_wheel_registers_console_script(wheel):
     with zipfile.ZipFile(wheel) as z:
-        entry = z.read("pretender-1.0.0.dist-info/entry_points.txt").decode()
+        entry = z.read("pretender-1.0.1.dist-info/entry_points.txt").decode()
     assert "pretender = pretender.cli:main" in entry
 
 

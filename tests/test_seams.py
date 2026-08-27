@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import typing
 from typing import Any
 
 from pretender.repo import SqliteRepository
@@ -98,6 +99,22 @@ def _snapshot(**kw: Any) -> GateSnapshot:
     base.update(kw)
     return GateSnapshot(**base)
 
+
+def _protocol_members(protocol: type[Any]) -> set[str]:
+    get_protocol_members = getattr(typing, "get_protocol_members", None)
+    if get_protocol_members is not None:
+        return set(get_protocol_members(protocol))
+
+    members: set[str] = set()
+    for base in protocol.__mro__:
+        members.update(
+            name for name in getattr(base, "__annotations__", {})
+            if not name.startswith("_")
+        )
+        members.update(name for name in vars(base) if not name.startswith("_"))
+    return members
+
+
 # The full required surface, in the order the protocol declares it.
 REQUIRED_METHODS = (
     "get_chat",
@@ -140,7 +157,7 @@ REQUIRED_METHODS = (
 # ── Async surface ───────────────────────────────────────────────────────────
 
 def test_repository_protocol_declares_exactly_the_required_methods():
-    protocol_attrs = getattr(Repository, "__protocol_attrs__")
+    protocol_attrs = _protocol_members(Repository)
     assert set(protocol_attrs) == set(REQUIRED_METHODS)
 
 
@@ -164,7 +181,7 @@ def test_no_independent_cursor_advance_method():
     assert not hasattr(Repository, "set_cursor")
     assert not hasattr(Repository, "move_cursor")
     # ...and no method takes a cursor parameter either.
-    for name in getattr(Repository, "__protocol_attrs__"):
+    for name in _protocol_members(Repository):
         params = inspect.signature(getattr(Repository, name)).parameters
         assert "cursor" not in params, f"{name} takes a cursor parameter"
         assert "after_cursor" not in params, f"{name} takes an after_cursor parameter"
@@ -544,14 +561,14 @@ def test_gate_snapshot_satisfies_gate_context_protocol():
     )
     assert isinstance(snap, GateContext)
     assert set(GateSnapshot.__dataclass_fields__) == set(
-        getattr(GateContext, "__protocol_attrs__")
+        _protocol_members(GateContext)
     )
 
 
 def test_gate_context_exposes_all_frozen_evaluation_facts():
     # Every fact a GateFeature may read is a documented protocol attribute —
     # no feature needs undocumented concrete state or direct DB access.
-    attrs = set(getattr(GateContext, "__protocol_attrs__"))
+    attrs = _protocol_members(GateContext)
     assert len(attrs) == 32
     for name in (
         "chat_key", "cycle_id", "start_msg_id", "through_msg_id",
@@ -593,7 +610,7 @@ def test_gate_context_rejects_old_minimal_shape():
 def test_gate_context_has_no_method_surface():
     # GateContext is a pure data protocol: every protocol attribute is a
     # data attribute, so a frozen dataclass can satisfy it structurally.
-    for attr in getattr(GateContext, "__protocol_attrs__"):
+    for attr in _protocol_members(GateContext):
         assert not callable(getattr(GateContext, attr, None)), attr
 
 
@@ -648,7 +665,7 @@ REQUIRED_KNOWLEDGE_METHODS = (
 
 
 def test_knowledge_repository_protocol_declares_exactly_the_required_methods():
-    protocol_attrs = getattr(KnowledgeRepository, "__protocol_attrs__")
+    protocol_attrs = _protocol_members(KnowledgeRepository)
     assert set(protocol_attrs) == set(REQUIRED_KNOWLEDGE_METHODS)
 
 
@@ -981,7 +998,7 @@ REQUIRED_ADAPTIVE_METHODS = (
 
 
 def test_adaptive_repository_protocol_declares_exactly_the_required_methods():
-    protocol_attrs = getattr(AdaptiveRepository, "__protocol_attrs__")
+    protocol_attrs = _protocol_members(AdaptiveRepository)
     assert set(protocol_attrs) == set(REQUIRED_ADAPTIVE_METHODS)
 
 
@@ -1231,7 +1248,7 @@ REQUIRED_MEDIA_METHODS = (
 
 
 def test_media_repository_protocol_declares_exactly_the_required_methods():
-    protocol_attrs = getattr(MediaRepository, "__protocol_attrs__")
+    protocol_attrs = _protocol_members(MediaRepository)
     assert set(protocol_attrs) == set(REQUIRED_MEDIA_METHODS)
 
 

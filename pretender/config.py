@@ -20,6 +20,7 @@ import math
 import os
 import re
 import tomllib
+import types
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -969,7 +970,7 @@ def _coerce(expected: Any, value: Any, path: str) -> Any:
         return expected(_coerce(supertype, value, path))
 
     # Optional[X] / X | None
-    if origin is typing.Union:
+    if origin in (typing.Union, types.UnionType):
         args = get_args(expected)
         if type(None) in args and value is None:
             return None

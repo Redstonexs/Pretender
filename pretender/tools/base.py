@@ -27,6 +27,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
+import types
 import typing
 from dataclasses import dataclass
 from typing import Any, Callable, get_args, get_origin
@@ -358,7 +359,7 @@ def _type_to_schema(t: Any) -> dict[str, Any]:
     if t is Any or t is inspect.Parameter.empty:
         return {}
     origin = get_origin(t)
-    if origin is typing.Union:
+    if origin in (typing.Union, types.UnionType):
         args = [a for a in get_args(t) if a is not type(None)]
         if len(args) == 1:
             return _with_null(_type_to_schema(args[0]))

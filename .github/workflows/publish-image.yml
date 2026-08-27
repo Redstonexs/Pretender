@@ -16,6 +16,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.release-tag.outputs.release_tag }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -47,7 +48,7 @@ jobs:
         run: python -m pip install ".[test]"
 
       - name: Run tests
-        run: python -m pytest
+        run: python -m pytest -vv --durations=0 -rw -o faulthandler_timeout=60
 
   publish:
     needs: test

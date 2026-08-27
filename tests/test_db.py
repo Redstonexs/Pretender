@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -270,8 +271,14 @@ def test_reads_use_thread_local_connections(tmp_path):
     async def scenario():
         db = Database(tmp_path / "t.db")
         await db.open()
+        barrier = threading.Barrier(2, timeout=5)
+
+        def connection_id(conn):
+            barrier.wait()
+            return id(conn)
+
         conn_ids = await asyncio.gather(
-            *[db.read(lambda c: id(c)) for _ in range(8)]
+            *[db.read(connection_id) for _ in range(2)]
         )
         await db.close()
         return conn_ids
