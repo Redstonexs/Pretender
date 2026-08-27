@@ -17,6 +17,8 @@ jobs:
       release_tag: ${{ steps.release-tag.outputs.release_tag }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
     permissions:
       contents: read
     steps:

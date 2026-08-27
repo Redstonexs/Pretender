@@ -214,34 +214,53 @@ def test_learner_worker_queue_overflow_coalesces(tmp_path):
 def test_learner_worker_cancel_stops_cleanly(tmp_path):
     async def scenario():
         db, repo = await open_repo_with_chat(tmp_path / "t.db")
-        await seed_messages(repo, n=2)
-        await commit_records(repo, "expression", [
-            make_record("expression", {"situation": "a", "style": "活泼", "source_id": 1}),
-        ])
-        # New source beyond the watermark: the chat is pending.
-        await seed_messages(repo, n=1, prefix="new")
-        pipeline = FakePipeline()
-        scheduler = LearnerScheduler(
-            repo, pipeline, {"expression": EXPRESSION_SPEC},
-            VirtualClock(epoch=100.0),
-        )
-        task = asyncio.create_task(scheduler.run())
-        for _ in range(200):
-            if pipeline.calls:
-                break
-            await asyncio.sleep(0.01)
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        await repo.close()
-        return pipeline.calls
+            await seed_messages(repo, n=2)
+            await commit_records(repo, "expression", [
+                make_record("expression", {"situation": "a", "style": "活泼", "source_id": 1}),
+            ])
+            # New source beyond the watermark: the chat is pending.
+            await seed_messages(repo, n=1, prefix="new")
 
-    calls = run(scenario())
-    assert len(calls) >= 1
-    assert calls[0][0] == CK
-    assert calls[0][1] == "expression"
+            called = asyncio.Event()
+            release = asyncio.Event()
+
+            class SignalingPipeline:
+                def __init__(self):
+                    self.calls: list[tuple] = []
+
+                async def run(self, chat_key, spec, references=""):
+                    self.calls.append((chat_key, spec.name, references))
+                    called.set()
+                    await release.wait()
+                    return LearnerRunResult(
+                        learner=spec.name, chat_key=chat_key, outcome="success", run_id=1
+                    )
+
+            pipeline = SignalingPipeline()
+            scheduler = LearnerScheduler(
+                repo, pipeline, {"expression": EXPRESSION_SPEC},
+                VirtualClock(epoch=4_000.0, auto_advance=False),
+            )
+            task = asyncio.create_task(scheduler.run())
+            try:
+                await asyncio.wait_for(called.wait(), timeout=5.0)
+            finally:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except asyncio.CancelledError:
+                    pass
+
+            return pipeline.calls, scheduler
+        finally:
+            await asyncio.wait_for(repo.close(), timeout=5.0)
+
+    calls, scheduler = run(scenario())
+    assert calls == [(CK, "expression", "")]
+    assert scheduler._scan_task is None
+    assert not scheduler._workers
+    assert not scheduler._in_flight
 
 
 def test_learner_worker_oldest_first_cadence(tmp_path):
