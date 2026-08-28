@@ -64,7 +64,7 @@ python -m pytest
 
 ## Docker 部署
 
-以下 Compose 配置把配置文件放在 `/config/config.toml`，并从同一目录旁的
+以下方式都把配置文件挂载到 `/config/config.toml`，并从
 `/config/prompts` 读取相对 prompt 文件。先准备目录和配置：
 
 ```sh
@@ -74,9 +74,39 @@ export DEEPSEEK_API_KEY=...
 export DASHSCOPE_API_KEY=...
 export SILICONFLOW_API_KEY=...
 export ONEBOT_ACCESS_TOKEN=...
+```
+
+### Compose：本地源码镜像
+
+构建并启动当前源码：
+
+```sh
 docker compose build
 docker compose run --rm pretender init
 docker compose up -d
+```
+
+### Compose：已发布的 GHCR 镜像
+
+使用发布版本时指定明确的 release tag；不要在生产环境默认使用 `latest`：
+
+```sh
+export PRETENDER_IMAGE=ghcr.io/redstonexs/pretender:v1.0.2
+docker compose pull
+docker compose run --rm pretender init
+docker compose up -d --no-build
+```
+
+此路径不要运行 `docker compose build`，否则会改为构建本地源码镜像。
+
+查看日志或优雅停止 Compose 服务：
+
+```sh
+docker compose logs -f pretender
+# 保留容器，后续可用 `docker compose start` 恢复
+docker compose stop
+# 停止并移除容器；data/ 和 logs/ 绑定挂载会保留
+docker compose down
 ```
 
 镜像默认执行 `pretender run --live --config /config/config.toml`。Compose 将
@@ -85,6 +115,53 @@ embedding cache）和 `./logs` 挂载到容器。当前运行时的普通日志�
 将 JSONL 日志写入该挂载目录。请在首次启动前
 由宿主用户创建 `data`、`logs` 目录；若目录属其他 UID，请调整其写权限。
 密钥只在运行时从环境变量传入，不会写入镜像。
+
+### Docker：发布镜像生产部署
+
+下面是使用 GHCR 发布镜像的独立流程。将 `IMAGE` 替换为实际发布的 release tag；生产环境
+不要默认改用 `latest`：
+
+```sh
+IMAGE=ghcr.io/redstonexs/pretender:v1.0.2
+
+docker pull "$IMAGE"
+
+# 仅首次运行：初始化数据目录
+docker run --rm \
+  --network host \
+  --user "$(id -u):$(id -g)" \
+  --env DEEPSEEK_API_KEY \
+  --env DASHSCOPE_API_KEY \
+  --env SILICONFLOW_API_KEY \
+  --env ONEBOT_ACCESS_TOKEN \
+  -v "$PWD/config/config.toml:/config/config.toml:ro" \
+  -v "$PWD/prompts:/config/prompts:ro" \
+  -v "$PWD/data:/config/data" \
+  -v "$PWD/logs:/config/logs" \
+  "$IMAGE" init
+
+# 后台运行
+docker run -d --name pretender \
+  --restart unless-stopped \
+  --network host \
+  --user "$(id -u):$(id -g)" \
+  --env DEEPSEEK_API_KEY \
+  --env DASHSCOPE_API_KEY \
+  --env SILICONFLOW_API_KEY \
+  --env ONEBOT_ACCESS_TOKEN \
+  -v "$PWD/config/config.toml:/config/config.toml:ro" \
+  -v "$PWD/prompts:/config/prompts:ro" \
+  -v "$PWD/data:/config/data" \
+  -v "$PWD/logs:/config/logs" \
+  "$IMAGE" run --live
+
+docker logs -f pretender
+docker stop -t 10 pretender
+docker rm pretender
+```
+
+`init` 和运行命令都使用宿主用户、host 网络以及相同的配置、prompt、数据和日志挂载。
+命令不需要显式添加 `--config`，镜像 entrypoint 会提供 `/config/config.toml`。
 
 示例配置的 `adapter.onebot.mode = "reverse_ws"` 使用仅回环绑定
 `127.0.0.1:3001`。因此 Compose 使用 `network_mode: host` 且不发布任何

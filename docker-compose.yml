@@ -1,6 +1,6 @@
 services:
   pretender:
-    image: pretender:latest
+    image: "${PRETENDER_IMAGE:-pretender:latest}"
     build:
       context: .
       dockerfile: Dockerfile
