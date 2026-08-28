@@ -44,6 +44,7 @@ App adoption is a later lane; this module is adapter-local.
 from __future__ import annotations
 
 import asyncio
+import errno
 from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -367,15 +368,28 @@ class OneBotAdapter:
     # ── connection management ───────────────────────────────────────────────
 
     async def _start_reverse_server(self) -> None:
-        self._server = await ws_serve(
-            self._on_client,
-            self._cfg.host,
-            self._cfg.port,
-            ping_interval=20.0,
-            ping_timeout=20.0,
-            open_timeout=self._cfg.action_timeout_s,
-            max_size=16 * 1024 * 1024,
-        )
+        try:
+            self._server = await ws_serve(
+                self._on_client,
+                self._cfg.host,
+                self._cfg.port,
+                ping_interval=20.0,
+                ping_timeout=20.0,
+                open_timeout=self._cfg.action_timeout_s,
+                max_size=16 * 1024 * 1024,
+            )
+        except OSError as exc:
+            # A busy port is the single most common first-run failure, so it
+            # reports the address and the fix instead of a bare errno.
+            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                raise AdapterError(
+                    f"cannot bind the OneBot reverse WebSocket server to "
+                    f"{self._cfg.host}:{self._cfg.port} ({exc.strerror}). "
+                    f"Another process is using that port; set a free "
+                    f"adapter.onebot.port in the config and point NapCat at "
+                    f"the same port."
+                ) from exc
+            raise
 
     async def _on_client(self, conn: Any) -> None:
         """Reverse-server handler: verify the handshake (path, Origin, auth),

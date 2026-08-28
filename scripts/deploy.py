@@ -21,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
@@ -30,6 +29,11 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - native locking is Linux-oriented
     fcntl = None  # type: ignore[assignment]
+
+try:  # tomllib is 3.11+; the wizard still runs on the 3.9/3.10 system Python
+    import tomllib
+except ImportError:  # pragma: no cover - exercised only on older interpreters
+    tomllib = None  # type: ignore[assignment]
 
 
 DEFAULT_IMAGE = "ghcr.io/redstonexs/pretender:v1.0.2"
@@ -41,6 +45,166 @@ _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_CHARS = re.compile(r"^[A-Za-z0-9._\-/+=:@%]+$")
 WIZARD_LOCK_CONTAINER = "pretender-wizard-lock"
 WIZARD_LOCK_LABEL = "io.pretender.wizard-lock=true"
+DEFAULT_PORT = 3001
+#: How many ports above the preferred one are probed before giving up.
+PORT_SCAN_SPAN = 40
+DEFAULT_ONEBOT_PATH = "/onebot/v11/ws"
+
+
+# ── messages ────────────────────────────────────────────────────────────────
+# The wizard is used mostly by Chinese-speaking NapCat operators, so zh-CN is
+# the default and English is a flag away.  Every user-visible string lives
+# here: a missing key falls back to English and then to the key itself.
+
+MESSAGES: dict[str, dict[str, str]] = {
+    "zh": {
+        "prompt.target": "部署方式：1) Docker Compose（推荐） 2) docker run 3) 本机原生",
+        "prompt.native_mode": "本机运行方式：f) 前台运行（默认） s) systemd 用户服务",
+        "prompt.provider": "模型提供商：1) DeepSeek 2) OpenAI 3) 自定义 OpenAI 兼容接口",
+        "prompt.base_url": "OpenAI 兼容 base URL",
+        "prompt.planner_model": "模型 ID",
+        "prompt.reply_model": "回复模型 ID（留空与上面相同）",
+        "prompt.api_key": "API key（输入不回显）：",
+        "prompt.onebot_token": "OneBot token（留空自动生成；输入不回显）：",
+        "prompt.port": "OneBot 反向 WebSocket 端口",
+        "prompt.splitting": "启用消息分段",
+        "prompt.typo": "启用错别字模拟",
+        "prompt.media": "启用媒体库",
+        "prompt.image": "容器镜像",
+        "prompt.http_loopback": "这是本机回环上的明文 HTTP，确认允许",
+        "prompt.default": "默认",
+        "prompt.setup_gate": "按上述方案写入配置并安装（此步不会启动机器人）",
+        "prompt.start_gate": "现在启动机器人（live）",
+        "port.busy": "端口 {port} 已被占用{holder}，改用 {chosen}。",
+        "port.holder": "（占用者：{holder}）",
+        "summary.title": "部署方案（密钥已隐藏）：",
+        "summary.target": "部署方式",
+        "summary.provider": "提供商",
+        "summary.planner": "规划模型",
+        "summary.reply": "回复模型",
+        "summary.api_key": "API key",
+        "summary.token": "OneBot token",
+        "summary.redacted": "<已隐藏>",
+        "summary.features": "功能开关",
+        "summary.config": "配置文件",
+        "summary.storage": "数据库",
+        "summary.image": "镜像",
+        "summary.service": "运行方式",
+        "summary.port": "OneBot 端口",
+        "msg.cancelled": "已取消。",
+        "msg.dry_run": "演练模式：未写入任何文件，也未执行任何命令。",
+        "msg.setup_done": "配置已写入，安装完成。",
+        "msg.napcat_title": "下一步：在 NapCat 中配置反向 WebSocket 客户端",
+        "msg.napcat_url": "  连接地址：{url}",
+        "msg.napcat_token": "  访问令牌：与 {path} 中的 {env} 完全一致",
+        "msg.napcat_token_cmd": "  查看令牌：{command}",
+        "msg.napcat_wait": "在 NapCat 连接配置保存并生效后，再继续下一步。",
+        "msg.not_started": "安装完成，尚未启动。稍后执行：{command}",
+        "msg.started": "已启动。",
+        "msg.manage": "常用命令：",
+        "msg.systemd_linger": "已启用 systemd 用户服务；未自动开启 linger（注销后服务会停止，如需常驻请执行 loginctl enable-linger）。",
+        "error.prefix": "部署失败：{error}",
+        "error.port": "端口必须是 1024-65535 之间的整数",
+        "error.no_free_port": "{host} 上 {port} 起的 {span} 个端口都被占用；请手动指定一个空闲端口",
+        "error.listener": "{host}:{port} 已被占用{holder}；请换一个端口（--port）或停止占用进程",
+        "error.api_key_env": "非交互模式需要通过环境变量 {env} 提供 API key",
+    },
+    "en": {
+        "prompt.target": "Deployment target: 1) Docker Compose (recommended), 2) docker run, 3) native host",
+        "prompt.native_mode": "Native mode: f) foreground (default), s) systemd user service",
+        "prompt.provider": "Provider: 1) DeepSeek, 2) OpenAI, 3) custom OpenAI-compatible",
+        "prompt.base_url": "OpenAI-compatible base URL",
+        "prompt.planner_model": "Model ID",
+        "prompt.reply_model": "Reply model ID (blank reuses the one above)",
+        "prompt.api_key": "API key (input hidden): ",
+        "prompt.onebot_token": "OneBot token (blank generates one; input hidden): ",
+        "prompt.port": "OneBot reverse WebSocket port",
+        "prompt.splitting": "Enable message splitting",
+        "prompt.typo": "Enable typo simulation",
+        "prompt.media": "Enable media catalog",
+        "prompt.image": "Container image",
+        "prompt.http_loopback": "This is plain HTTP on loopback; explicitly allow it",
+        "prompt.default": "default",
+        "prompt.setup_gate": "Set up this plan now (no live process yet)",
+        "prompt.start_gate": "Start the live process now",
+        "port.busy": "Port {port} is already in use{holder}; using {chosen} instead.",
+        "port.holder": " (held by {holder})",
+        "summary.title": "Deployment plan (secrets redacted):",
+        "summary.target": "target",
+        "summary.provider": "provider",
+        "summary.planner": "planner model",
+        "summary.reply": "reply model",
+        "summary.api_key": "API key",
+        "summary.token": "OneBot token",
+        "summary.redacted": "<redacted>",
+        "summary.features": "features",
+        "summary.config": "config",
+        "summary.storage": "storage",
+        "summary.image": "image",
+        "summary.service": "service",
+        "summary.port": "OneBot port",
+        "msg.cancelled": "Cancelled.",
+        "msg.dry_run": "Dry run: no files were written and no commands were run.",
+        "msg.setup_done": "Configuration written; setup complete.",
+        "msg.napcat_title": "Next: configure the reverse WebSocket client in NapCat",
+        "msg.napcat_url": "  URL:   {url}",
+        "msg.napcat_token": "  Token: exactly the {env} value in {path}",
+        "msg.napcat_token_cmd": "  Read it with: {command}",
+        "msg.napcat_wait": "Continue only after NapCat has saved that connection.",
+        "msg.not_started": "Setup complete; live process was not started. Start it later with: {command}",
+        "msg.started": "Started.",
+        "msg.manage": "Useful commands:",
+        "msg.systemd_linger": "Systemd user service enabled; linger was not enabled automatically.",
+        "error.prefix": "Deployment failed: {error}",
+        "error.port": "port must be an integer between 1024 and 65535",
+        "error.no_free_port": "{span} ports from {port} up are all busy on {host}; pick a free port explicitly",
+        "error.listener": "{host}:{port} is already in use{holder}; choose another port (--port) or stop that process",
+        "error.api_key_env": "non-interactive mode needs the API key in the {env} environment variable",
+    },
+}
+
+_LANGUAGE = "zh"
+
+
+def detect_language(environ: Mapping[str, str] | None = None) -> str:
+    """Pick zh for Chinese locales, English otherwise; never raise."""
+
+    environ = os.environ if environ is None else environ
+    for name in ("PRETENDER_LANG", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = environ.get(name, "")
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered.startswith("zh") or "zh_" in lowered:
+            return "zh"
+        if lowered in {"c", "posix"}:
+            continue
+        return "en"
+    return "zh"
+
+
+def set_language(language: str) -> str:
+    """Set the wizard language; ``auto`` resolves from the environment."""
+
+    global _LANGUAGE
+    if language == "auto":
+        language = detect_language()
+    if language not in MESSAGES:
+        raise DeployError(f"unsupported language {language!r}")
+    _LANGUAGE = language
+    return _LANGUAGE
+
+
+def t(key: str, **values: Any) -> str:
+    """Look up a message, falling back to English and then to the key."""
+
+    template = MESSAGES.get(_LANGUAGE, {}).get(key) or MESSAGES["en"].get(key) or key
+    if not values:
+        return template
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError):
+        return template
 
 
 class DeployError(RuntimeError):
@@ -76,6 +240,13 @@ class DeploymentPlan:
     image: str = DEFAULT_IMAGE
     native_service: str = "foreground"
     home: Path = Path.home()
+    port: int = DEFAULT_PORT
+
+    @property
+    def onebot_url(self) -> str:
+        """The exact reverse-WebSocket URL NapCat has to dial."""
+
+        return f"ws://127.0.0.1:{self.port}{DEFAULT_ONEBOT_PATH}?message_format=array"
 
     @property
     def venv_path(self) -> Path:
@@ -124,14 +295,36 @@ def trusted_project_root() -> Path:
 
     root = Path(__file__).resolve().parents[1]
     manifest = root / "pyproject.toml"
-    try:
-        with manifest.open("rb") as stream:
-            project = tomllib.load(stream).get("project", {})
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise DeployError(f"trusted project root is invalid: {manifest}") from exc
-    if not isinstance(project, dict) or project.get("name") != "pretender":
+    if _manifest_project_name(manifest) != "pretender":
         raise DeployError(f"trusted project root is not Pretender: {root}")
     return root
+
+
+def _manifest_project_name(manifest: Path) -> str | None:
+    """Read ``[project] name`` from pyproject.toml, with a 3.10 fallback."""
+
+    try:
+        raw = manifest.read_bytes()
+    except OSError as exc:
+        raise DeployError(f"trusted project root is invalid: {manifest}") from exc
+    if tomllib is not None:
+        try:
+            project = tomllib.loads(raw.decode("utf-8")).get("project", {})
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise DeployError(f"trusted project root is invalid: {manifest}") from exc
+        return project.get("name") if isinstance(project, dict) else None
+    section = ""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip()
+            continue
+        if section != "project":
+            continue
+        match = re.fullmatch(r'name\s*=\s*"([^"]*)"', stripped)
+        if match:
+            return match.group(1)
+    return None
 
 
 def validate_model_id(value: str) -> str:
@@ -203,10 +396,14 @@ def toml_string(value: str, label: str = "value") -> str:
 
 
 def render_config(
-    provider: Provider, features: Features, storage_path: str
+    provider: Provider,
+    features: Features,
+    storage_path: str,
+    port: int = DEFAULT_PORT,
 ) -> str:
     """Render the minimal config; secrets are represented by one fixed ref."""
 
+    port = validate_port(port)
     base_url = validate_base_url(
         provider.base_url, allow_http_loopback=provider.http_loopback_confirmed
     )
@@ -250,8 +447,8 @@ def render_config(
             "[adapter.onebot]",
             'mode = "reverse_ws"',
             'host = "127.0.0.1"',
-            "port = 3001",
-            'path = "/onebot/v11/ws"',
+            f"port = {port}",
+            f"path = {toml_string(DEFAULT_ONEBOT_PATH, 'onebot path')}",
             f'access_token = "${{{ONEBOT_ENV}}}"',
             "",
             "[storage]",
@@ -363,6 +560,7 @@ def build_plan(
     home: str | Path | None = None,
     image: str = DEFAULT_IMAGE,
     native_service: str = "foreground",
+    port: int = DEFAULT_PORT,
 ) -> DeploymentPlan:
     if target not in {"compose", "docker", "native"}:
         raise DeployError("target must be compose, docker, or native")
@@ -408,6 +606,7 @@ def build_plan(
         image=image,
         native_service=native_service,
         home=home_path,
+        port=validate_port(port),
     )
 
 
@@ -738,7 +937,11 @@ def _commit_artifacts(
 
 def _write_artifacts(plan: DeploymentPlan, *, force: bool) -> _ArtifactReceipt:
     artifacts: list[tuple[Path, str, int]] = [
-        (plan.config_path, render_config(plan.provider, plan.features, plan.storage_path), 0o644),
+        (
+            plan.config_path,
+            render_config(plan.provider, plan.features, plan.storage_path, plan.port),
+            0o644,
+        ),
     ]
     if plan.target == "native":
         artifacts.append((plan.environment_path, render_systemd_environment(plan), 0o600))
@@ -892,19 +1095,104 @@ def _compose_command(plan: DeploymentPlan, *args: str) -> list[str]:
     ]
 
 
-def check_listener(
-    host: str = "127.0.0.1", port: int = 3001, *, timeout: float = 0.25
-) -> None:
-    """Fail clearly when the reverse-WebSocket listener port is occupied."""
+def validate_port(value: Any) -> int:
+    """Return an unprivileged TCP port, rejecting anything else."""
 
+    if isinstance(value, bool):
+        raise DeployError(t("error.port"))
+    if isinstance(value, str):
+        text = _text(value, "port").strip()
+        if not text.isdigit():
+            raise DeployError(t("error.port"))
+        value = int(text)
+    if not isinstance(value, int) or not 1024 <= value <= 65535:
+        raise DeployError(t("error.port"))
+    return value
+
+
+def port_available(port: int, host: str = "127.0.0.1", *, timeout: float = 0.25) -> bool:
+    """Return whether a listener could bind ``host:port`` right now."""
+
+    port = validate_port(port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
         sock.bind((host, port))
-    except OSError as exc:
-        raise DeployError(f"{host}:{port} is already in use; refusing to start") from exc
+    except OSError:
+        return False
     finally:
         sock.close()
+    return True
+
+
+def describe_port_holder(port: int, *, timeout: float = 3.0) -> str:
+    """Best-effort name of whatever is listening on a port; never raises.
+
+    A busy 3001 is the most common first-run failure, so naming the holder
+    turns a dead end into an obvious next step.  Missing tooling, permission
+    limits and odd output all degrade to an empty string.
+    """
+
+    try:
+        port = validate_port(port)
+    except DeployError:
+        return ""
+    executable = shutil.which("ss")
+    argv = [executable, "-ltnpH"] if executable else None
+    if argv is None:
+        executable = shutil.which("lsof")
+        if executable is None:
+            return ""
+        argv = [executable, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in (completed.stdout or "").splitlines():
+        if f":{port} " not in f"{line} ":
+            continue
+        match = re.search(r'"([^"]{1,64})",pid=(\d{1,10})', line)
+        if match:
+            return f"{match.group(1)} pid={match.group(2)}"
+        fields = line.split()
+        if executable.endswith("lsof") and len(fields) >= 2:
+            return f"{fields[0]} pid={fields[1]}"
+    return ""
+
+
+def _holder_suffix(port: int) -> str:
+    holder = describe_port_holder(port)
+    return t("port.holder", holder=holder) if holder else ""
+
+
+def find_free_port(
+    preferred: int = DEFAULT_PORT,
+    host: str = "127.0.0.1",
+    *,
+    span: int = PORT_SCAN_SPAN,
+) -> int:
+    """Return ``preferred`` when it is free, else the next free port above it."""
+
+    preferred = validate_port(preferred)
+    for candidate in range(preferred, min(preferred + max(span, 1), 65536)):
+        if port_available(candidate, host):
+            return candidate
+    raise DeployError(
+        t("error.no_free_port", host=host, port=preferred, span=span)
+    )
+
+
+def check_listener(
+    host: str = "127.0.0.1", port: int = DEFAULT_PORT, *, timeout: float = 0.25
+) -> None:
+    """Fail clearly when the reverse-WebSocket listener port is occupied."""
+
+    if not port_available(port, host, timeout=timeout):
+        raise DeployError(
+            t("error.listener", host=host, port=port, holder=_holder_suffix(port))
+        )
 
 
 def _preflight_destinations(plan: DeploymentPlan, *, force: bool) -> None:
@@ -1122,7 +1410,7 @@ def setup_plan(
     """Preflight and install artifacts, but never start a live process."""
 
     runner = runner or CommandRunner()
-    listener_checker = listener_checker or check_listener
+    listener_checker = listener_checker or (lambda: check_listener(port=plan.port))
     _preflight_destinations(plan, force=force)
     if plan.target in {"compose", "docker"}:
         _preflight_docker(plan, runner, listener_checker=listener_checker)
@@ -1205,7 +1493,7 @@ def start_plan(
     """Run only after the caller has obtained the second confirmation."""
 
     runner = runner or CommandRunner()
-    listener_checker = listener_checker or check_listener
+    listener_checker = listener_checker or (lambda: check_listener(port=plan.port))
     if plan.target in {"compose", "docker"}:
         _preflight_docker(plan, runner, listener_checker=listener_checker)
         if plan.target == "compose":
@@ -1236,7 +1524,7 @@ def start_plan(
                     "systemd start failed and disabling the service also failed"
                 ) from cleanup_error
             raise start_error
-        output("Systemd user service enabled; linger was not enabled automatically.")
+        output(t("msg.systemd_linger"))
         return
     environment = dict(os.environ)
     environment.update({LLM_ENV: plan.provider.api_key, ONEBOT_ENV: plan.onebot_token})
@@ -1268,24 +1556,93 @@ def apply_plan(
 
 
 def plan_summary(plan: DeploymentPlan) -> str:
+    redacted = t("summary.redacted")
     lines = [
-        "Deployment plan (secrets redacted):",
-        f"  target: {plan.target}",
-        f"  provider: {plan.provider.base_url}",
-        f"  planner model: {plan.provider.planner_model}",
-        f"  reply model: {plan.provider.reply_model}",
-        "  API key: <redacted>",
-        "  OneBot token: <redacted>",
-        f"  features: splitting={plan.features.splitting}, typo={plan.features.typo}, "
-        f"media={plan.features.media_enabled}",
-        f"  config: {plan.config_path.resolve()}",
-        f"  storage: {plan.storage_path}",
+        t("summary.title"),
+        f"  {t('summary.target')}: {plan.target}",
+        f"  {t('summary.provider')}: {plan.provider.base_url}",
+        f"  {t('summary.planner')}: {plan.provider.planner_model}",
+        f"  {t('summary.reply')}: {plan.provider.reply_model}",
+        f"  {t('summary.api_key')}: {redacted}",
+        f"  {t('summary.token')}: {redacted}",
+        f"  {t('summary.features')}: splitting={plan.features.splitting}, "
+        f"typo={plan.features.typo}, media={plan.features.media_enabled}",
+        f"  {t('summary.port')}: {plan.port}",
+        f"  {t('summary.config')}: {plan.config_path.resolve()}",
+        f"  {t('summary.storage')}: {plan.storage_path}",
     ]
     if plan.target in {"compose", "docker"}:
-        lines.append(f"  image: {plan.image}")
+        lines.append(f"  {t('summary.image')}: {plan.image}")
     else:
-        lines.append(f"  service: {plan.native_service}")
+        lines.append(f"  {t('summary.service')}: {plan.native_service}")
     return "\n".join(lines)
+
+
+def token_reveal_command(plan: DeploymentPlan) -> str:
+    """The one command that prints the stored OneBot token, and nothing else."""
+
+    if plan.target == "compose":
+        return "./deploy.sh token"
+    path = plan.environment_path.resolve()
+    return f"grep '^{ONEBOT_ENV}=' {path} | cut -d= -f2-"
+
+
+def start_command(plan: DeploymentPlan) -> str:
+    """The command that starts the deployment the wizard just installed."""
+
+    if plan.target == "compose":
+        return "./deploy.sh start"
+    if plan.target == "docker":
+        return f"docker start pretender  # {t('summary.image')}: {plan.image}"
+    if plan.native_service == "systemd":
+        return "systemctl --user start pretender.service"
+    executable = plan.venv_path / "bin" / "pretender"
+    return f"{executable} run --live --config {plan.config_path.resolve()}"
+
+
+def napcat_instructions(plan: DeploymentPlan) -> str:
+    """Print the exact NapCat wiring; the token itself is never printed."""
+
+    return "\n".join(
+        [
+            t("msg.napcat_title"),
+            t("msg.napcat_url", url=plan.onebot_url),
+            t(
+                "msg.napcat_token",
+                env=ONEBOT_ENV,
+                path=plan.environment_path.resolve(),
+            ),
+            t("msg.napcat_token_cmd", command=token_reveal_command(plan)),
+            t("msg.napcat_wait"),
+        ]
+    )
+
+
+def manage_commands(plan: DeploymentPlan) -> str:
+    """Post-install cheat sheet, matched to the target that was installed."""
+
+    if plan.target == "compose":
+        commands = [
+            "./deploy.sh logs",
+            "./deploy.sh status",
+            "./deploy.sh stop",
+            "./deploy.sh update",
+        ]
+    elif plan.target == "docker":
+        commands = [
+            "docker logs -f pretender",
+            "docker ps --filter name=pretender",
+            "docker stop -t 30 pretender",
+        ]
+    elif plan.native_service == "systemd":
+        commands = [
+            "journalctl --user -u pretender.service -f",
+            "systemctl --user status pretender.service",
+            "systemctl --user stop pretender.service",
+        ]
+    else:
+        commands = [start_command(plan)]
+    return "\n".join([t("msg.manage"), *(f"  {command}" for command in commands)])
 
 
 Input = Callable[[str], str]
@@ -1316,12 +1673,80 @@ def _choice(
     default: str | None = None,
 ) -> str:
     while True:
-        suffix = f"; default {default}" if default is not None else ""
+        suffix = f"; {t('prompt.default')} {default}" if default is not None else ""
         answer = input_fn(f"{prompt} ({'/'.join(choices)}{suffix}): ").strip().lower()
         if not answer and default is not None:
             answer = default
         if answer in choices:
             return choices[answer]
+
+
+def _prompt_port(
+    input_fn: Input,
+    output: Callable[[str], None],
+    preferred: int = DEFAULT_PORT,
+) -> int:
+    """Offer a free port, and never accept one that is already taken.
+
+    Port 3001 collides constantly (another OneBot bridge, a dev server), so
+    the wizard probes upward for a free port and offers that as the default
+    instead of failing later during startup.
+    """
+
+    suggested = find_free_port(preferred)
+    if suggested != preferred:
+        output(
+            t(
+                "port.busy",
+                port=preferred,
+                holder=_holder_suffix(preferred),
+                chosen=suggested,
+            )
+        )
+    while True:
+        answer = _ask(input_fn, t("prompt.port"), str(suggested))
+        try:
+            candidate = validate_port(answer)
+        except DeployError as exc:
+            output(str(exc))
+            continue
+        if port_available(candidate):
+            return candidate
+        output(
+            t(
+                "error.listener",
+                host="127.0.0.1",
+                port=candidate,
+                holder=_holder_suffix(candidate),
+            )
+        )
+        suggested = find_free_port(candidate)
+
+
+def _provider_defaults(kind: str, input_fn: Input) -> tuple[str, str | None]:
+    if kind == "deepseek":
+        return "https://api.deepseek.com/v1", "deepseek-chat"
+    if kind == "openai":
+        return "https://api.openai.com/v1", "gpt-4o-mini"
+    return _ask(input_fn, t("prompt.base_url")), None
+
+
+def _confirm_base_url(base_url: str, input_fn: Input) -> tuple[str, bool]:
+    """Validate a base URL, allowing loopback HTTP only when confirmed."""
+
+    try:
+        validate_base_url(base_url)
+    except DeployError:
+        parts = urlsplit(base_url)
+        if parts.scheme == "http" and _is_loopback(parts.hostname):
+            if not _yes_no(input_fn, t("prompt.http_loopback"), False):
+                raise DeployError(
+                    "plain HTTP loopback endpoint was not confirmed"
+                )
+            validate_base_url(base_url, allow_http_loopback=True)
+            return base_url, True
+        raise
+    return base_url, False
 
 
 def gather_plan(
@@ -1331,70 +1756,132 @@ def gather_plan(
     output: Callable[[str], None] = print,
     project_root: str | Path | None = None,
     home: str | Path | None = None,
+    advanced: bool = False,
+    port: int | None = None,
 ) -> DeploymentPlan:
+    """Collect a plan.  The express path defaults everything that has a sane
+    default; ``advanced`` asks the full set of questions instead."""
+
     target = _choice(
         input_fn,
-        "Deployment target: 1) Docker Compose, 2) docker run, 3) native host",
+        t("prompt.target"),
         {"1": "compose", "2": "docker", "3": "native"},
+        default="1",
     )
     native_service = "foreground"
     if target == "native":
         native_service = _choice(
             input_fn,
-            "Native mode: foreground (default) or systemd user-service",
+            t("prompt.native_mode"),
             {"f": "foreground", "foreground": "foreground", "s": "systemd", "systemd": "systemd"},
             default="f",
         )
     provider_kind = _choice(
         input_fn,
-        "Provider: 1) DeepSeek, 2) OpenAI, 3) custom OpenAI-compatible",
+        t("prompt.provider"),
         {"1": "deepseek", "2": "openai", "3": "custom"},
+        default="1",
     )
-    if provider_kind == "deepseek":
-        base_url = "https://api.deepseek.com/v1"
-        model_default = "deepseek-chat"
-    elif provider_kind == "openai":
-        base_url = "https://api.openai.com/v1"
-        model_default = None
-    else:
-        base_url = _ask(input_fn, "OpenAI-compatible base URL")
-        model_default = None
-    http_loopback_confirmed = False
-    try:
-        validate_base_url(base_url)
-    except DeployError:
-        parts = urlsplit(base_url)
-        if parts.scheme == "http" and _is_loopback(parts.hostname):
-            if not _yes_no(input_fn, "This is plain HTTP on loopback; explicitly allow it", False):
-                raise DeployError("plain HTTP loopback endpoint was not confirmed")
-            validate_base_url(base_url, allow_http_loopback=True)
-            http_loopback_confirmed = True
-        else:
-            raise
-    planner_model = _ask(input_fn, "Planner model", model_default)
+    base_url, model_default = _provider_defaults(provider_kind, input_fn)
+    base_url, http_loopback_confirmed = _confirm_base_url(base_url, input_fn)
+    planner_model = _ask(input_fn, t("prompt.planner_model"), model_default)
     validate_model_id(planner_model)
-    reply_model = _ask(input_fn, "Reply model (blank uses planner)", planner_model)
-    if reply_model == "":
-        reply_model = planner_model
+    reply_model = planner_model
+    if advanced:
+        reply_model = _ask(input_fn, t("prompt.reply_model"), planner_model)
+        if reply_model == "":
+            reply_model = planner_model
     validate_model_id(reply_model)
-    api_key = validate_secret(secret_fn("API key (input hidden): "), "API key")
-    supplied_token = secret_fn("OneBot token (blank generates one; input hidden): ")
-    token = validate_secret(supplied_token, "OneBot token") if supplied_token.strip() else secrets.token_hex(32)
-    splitting = _yes_no(input_fn, "Enable message splitting", True)
-    typo = _yes_no(input_fn, "Enable typo simulation", True)
-    media = _yes_no(input_fn, "Enable media catalog", False)
+    api_key = validate_secret(secret_fn(t("prompt.api_key")), "API key")
+    token = secrets.token_hex(32)
+    if advanced:
+        supplied_token = secret_fn(t("prompt.onebot_token"))
+        if supplied_token.strip():
+            token = validate_secret(supplied_token, "OneBot token")
+    chosen_port = (
+        validate_port(port)
+        if port is not None
+        else _prompt_port(input_fn, output)
+    )
+    features = Features()
     image = DEFAULT_IMAGE
-    if target in {"compose", "docker"}:
-        image = _ask(input_fn, "Container image", DEFAULT_IMAGE)
+    if advanced:
+        features = Features(
+            _yes_no(input_fn, t("prompt.splitting"), True),
+            _yes_no(input_fn, t("prompt.typo"), True),
+            _yes_no(input_fn, t("prompt.media"), False),
+        )
+        if target in {"compose", "docker"}:
+            image = _ask(input_fn, t("prompt.image"), DEFAULT_IMAGE)
     return build_plan(
         target,
         Provider(base_url, planner_model, reply_model, api_key, http_loopback_confirmed),
-        Features(splitting, typo, media),
+        features,
         token,
         project_root=project_root,
         home=home,
         image=image,
         native_service=native_service,
+        port=chosen_port,
+    )
+
+
+def plan_from_options(
+    *,
+    target: str = "compose",
+    provider_kind: str = "deepseek",
+    base_url: str | None = None,
+    planner_model: str | None = None,
+    reply_model: str | None = None,
+    port: int | None = None,
+    image: str = DEFAULT_IMAGE,
+    native_service: str = "foreground",
+    features: Features | None = None,
+    environ: Mapping[str, str] | None = None,
+    project_root: str | Path | None = None,
+    home: str | Path | None = None,
+    api_key_env: str = LLM_ENV,
+    token_env: str = ONEBOT_ENV,
+) -> DeploymentPlan:
+    """Build a plan without prompting, for scripted/unattended deployment.
+
+    Secrets come from the environment, never from argv: a command line is
+    visible in ``ps`` output and lands in shell history.
+    """
+
+    environ = os.environ if environ is None else environ
+    if not _ENV_KEY.fullmatch(api_key_env) or not _ENV_KEY.fullmatch(token_env):
+        raise DeployError("environment variable names must be identifier-shaped")
+    api_key = (environ.get(api_key_env) or "").strip()
+    if not api_key:
+        raise DeployError(t("error.api_key_env", env=api_key_env))
+    supplied_token = (environ.get(token_env) or "").strip()
+    token = validate_secret(supplied_token, "OneBot token") if supplied_token else secrets.token_hex(32)
+    if provider_kind == "deepseek":
+        resolved_url, model_default = "https://api.deepseek.com/v1", "deepseek-chat"
+    elif provider_kind == "openai":
+        resolved_url, model_default = "https://api.openai.com/v1", "gpt-4o-mini"
+    elif provider_kind == "custom":
+        if not base_url:
+            raise DeployError("a custom provider requires --base-url")
+        resolved_url, model_default = base_url, None
+    else:
+        raise DeployError("provider must be deepseek, openai, or custom")
+    resolved_url = base_url or resolved_url
+    planner = planner_model or model_default
+    if not planner:
+        raise DeployError("a model ID is required (--model)")
+    chosen_port = validate_port(port) if port is not None else find_free_port()
+    return build_plan(
+        target,
+        Provider(resolved_url, planner, reply_model or planner, validate_secret(api_key, "API key")),
+        features or Features(),
+        token,
+        project_root=project_root,
+        home=home,
+        image=image,
+        native_service=native_service,
+        port=chosen_port,
     )
 
 
@@ -1410,20 +1897,28 @@ def run_wizard(
     session_lock: SessionLockProtocol | None = None,
     project_root: str | Path | None = None,
     home: str | Path | None = None,
+    advanced: bool = False,
+    port: int | None = None,
+    plan: DeploymentPlan | None = None,
+    assume_yes: bool = False,
+    start: bool = False,
 ) -> DeploymentPlan | None:
-    plan = gather_plan(
-        input_fn=input_fn,
-        secret_fn=secret_fn,
-        output=output,
-        project_root=project_root,
-        home=home,
-    )
+    if plan is None:
+        plan = gather_plan(
+            input_fn=input_fn,
+            secret_fn=secret_fn,
+            output=output,
+            project_root=project_root,
+            home=home,
+            advanced=advanced,
+            port=port,
+        )
     output(plan_summary(plan))
-    if not _yes_no(input_fn, "Set up this plan now (no live process yet)", False):
-        output("Cancelled.")
+    if not assume_yes and not _yes_no(input_fn, t("prompt.setup_gate"), False):
+        output(t("msg.cancelled"))
         return None
     if dry_run:
-        output("Dry run: no files were written and no commands were run.")
+        output(t("msg.dry_run"))
         return plan
     runner = runner or CommandRunner()
     shared_lock: SessionLockProtocol = session_lock or UserWizardLock(plan)
@@ -1441,14 +1936,15 @@ def run_wizard(
             listener_checker=listener_checker,
             docker_lock=docker_lock,
         )
-        output(
-            "Setup complete. Securely open the protected environment file to configure "
-            "the generated OneBot token in NapCat."
-        )
-        if not _yes_no(input_fn, "Start the live process now", False):
-            output("Setup complete; live process was not started.")
+        output(t("msg.setup_done"))
+        output(napcat_instructions(plan))
+        if not start and not _yes_no(input_fn, t("prompt.start_gate"), False):
+            output(t("msg.not_started", command=start_command(plan)))
+            output(manage_commands(plan))
             return plan
         start_plan(plan, runner=runner, listener_checker=listener_checker, output=output)
+        output(t("msg.started"))
+        output(manage_commands(plan))
         return plan
     finally:
         if docker_lock is not None:
@@ -1460,11 +1956,78 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pretender deployment wizard")
     parser.add_argument("--dry-run", action="store_true", help="plan only; do not write or start")
     parser.add_argument("--force", action="store_true", help="replace wizard-owned files after backing them up")
+    parser.add_argument(
+        "--lang", choices=("auto", "zh", "en"), default="auto",
+        help="wizard language (default: detected from the locale)",
+    )
+    parser.add_argument(
+        "--advanced", action="store_true",
+        help="ask every question instead of defaulting the optional ones",
+    )
+    parser.add_argument(
+        "--port", default=None,
+        help=f"OneBot reverse WebSocket port (default: first free port from {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--non-interactive", action="store_true",
+        help="build the plan from flags and environment variables; ask nothing",
+    )
+    parser.add_argument("--target", choices=("compose", "docker", "native"), default="compose")
+    parser.add_argument("--provider", choices=("deepseek", "openai", "custom"), default="deepseek")
+    parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL")
+    parser.add_argument("--model", default=None, help="planner model ID")
+    parser.add_argument("--reply-model", default=None, help="reply model ID (default: --model)")
+    parser.add_argument("--image", default=DEFAULT_IMAGE, help="container image for Docker targets")
+    parser.add_argument("--native-service", choices=("foreground", "systemd"), default="foreground")
+    parser.add_argument(
+        "--api-key-env", default=LLM_ENV,
+        help=f"environment variable holding the LLM API key (default: {LLM_ENV})",
+    )
+    parser.add_argument(
+        "--token-env", default=ONEBOT_ENV,
+        help=f"environment variable holding the OneBot token (default: {ONEBOT_ENV}; generated when unset)",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="skip the setup confirmation (the live-start gate still applies unless --start)",
+    )
+    parser.add_argument(
+        "--start", action="store_true",
+        help="start the live process once setup succeeds; NapCat must already be configured",
+    )
     args = parser.parse_args(argv)
     try:
-        run_wizard(dry_run=args.dry_run, force=args.force)
+        set_language(args.lang)
+        port = validate_port(args.port) if args.port is not None else None
+        plan = None
+        if args.non_interactive:
+            plan = plan_from_options(
+                target=args.target,
+                provider_kind=args.provider,
+                base_url=args.base_url,
+                planner_model=args.model,
+                reply_model=args.reply_model,
+                port=port,
+                image=args.image,
+                native_service=args.native_service,
+                api_key_env=args.api_key_env,
+                token_env=args.token_env,
+            )
+        run_wizard(
+            dry_run=args.dry_run,
+            force=args.force,
+            advanced=args.advanced,
+            port=port,
+            plan=plan,
+            assume_yes=args.yes or args.non_interactive,
+            start=args.start,
+        )
+    except (KeyboardInterrupt, EOFError):
+        print("", file=sys.stderr)
+        print(t("msg.cancelled"), file=sys.stderr)
+        return 130
     except (DeployError, OSError, subprocess.CalledProcessError) as exc:
-        print(f"Deployment failed: {exc}", file=sys.stderr)
+        print(t("error.prefix", error=exc), file=sys.stderr)
         return 1
     return 0
 

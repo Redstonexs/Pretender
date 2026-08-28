@@ -1747,3 +1747,26 @@ def test_repeated_identical_fallback_echo_correlation():
         return True
 
     assert run(scenario()) is True
+
+
+def test_busy_reverse_port_reports_the_address_and_the_fix():
+    """A taken port is the most common first-run failure; it must not surface
+    as a bare errno."""
+
+    async def scenario() -> None:
+        holder = await ws_serve(lambda _conn: None, "127.0.0.1", 0)
+        port = holder.sockets[0].getsockname()[1]
+        adapter = make_adapter(
+            config=OneBotConfig(host="127.0.0.1", port=port, heartbeat_timeout_s=None)
+        )
+        try:
+            with pytest.raises(AdapterError) as caught:
+                await adapter.connect()
+            message = str(caught.value)
+            assert f"127.0.0.1:{port}" in message
+            assert "adapter.onebot.port" in message
+        finally:
+            holder.close()
+            await holder.wait_closed()
+
+    run(scenario())

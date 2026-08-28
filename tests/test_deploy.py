@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import shutil
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,20 @@ def provider(key: str = "generic-api-key") -> deploy.Provider:
     )
 
 
+@pytest.fixture(autouse=True)
+def english_wizard():
+    """Assertions below match message text, so pin the language."""
+
+    previous = deploy._LANGUAGE
+    deploy.set_language("en")
+    yield
+    deploy.set_language(previous)
+
+
+#: Passed explicitly so wizard tests never probe or bind a real port.
+TEST_PORT = 34101
+
+
 def plan(tmp_path: Path, target: str = "compose", service: str = "foreground", home_path: Path | None = None):
     return deploy.build_plan(
         target,
@@ -28,6 +43,7 @@ def plan(tmp_path: Path, target: str = "compose", service: str = "foreground", h
         project_root=tmp_path / "project",
         home=home_path or tmp_path / "home",
         native_service=service,
+        port=TEST_PORT,
     )
 
 
@@ -424,10 +440,10 @@ def test_active_systemd_service_is_rejected_before_writes(tmp_path, monkeypatch)
 
 
 def test_dry_run_and_second_start_gate(tmp_path):
-    # target, provider, planner, reply, splitting, typo, media, image, setup,
-    # then the start gate.  Empty OneBot input requests generation.
-    answers = iter(["1", "1", "", "", "", "", "", "", "y", "n"])
-    hidden = iter(["secret-api", ""])
+    # Express flow: target, provider, model, then the setup and start gates.
+    # The OneBot token is generated without a prompt.
+    answers = iter(["1", "1", "", "y", "n"])
+    hidden = iter(["secret-api"])
     output: list[str] = []
     runner = FakeRunner()
     result = deploy.run_wizard(
@@ -438,6 +454,7 @@ def test_dry_run_and_second_start_gate(tmp_path):
         listener_checker=lambda: None,
         project_root=tmp_path,
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     assert result is not None
     assert not any(command[-2:] == ["up", "-d"] for command, _ in runner.calls)
@@ -446,8 +463,8 @@ def test_dry_run_and_second_start_gate(tmp_path):
 
 
 def test_dry_run_has_no_writes_or_runner_calls(tmp_path):
-    answers = iter(["1", "1", "", "", "", "", "", "", "n"])
-    hidden = iter(["secret-api", ""])
+    answers = iter(["1", "1", "", "n"])
+    hidden = iter(["secret-api"])
     output: list[str] = []
     runner = FakeRunner()
     result = deploy.run_wizard(
@@ -458,6 +475,7 @@ def test_dry_run_has_no_writes_or_runner_calls(tmp_path):
         runner=runner,
         project_root=tmp_path,
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     assert result is None
     assert runner.calls == []
@@ -467,8 +485,8 @@ def test_dry_run_has_no_writes_or_runner_calls(tmp_path):
 
 
 def test_native_foreground_is_default_and_generated_token_is_not_printed(monkeypatch, tmp_path):
-    answers = iter(["3", "", "1", "", "", "", "", ""])
-    hidden = iter(["safe-api", ""])
+    answers = iter(["3", "", "1", ""])
+    hidden = iter(["safe-api"])
     output: list[str] = []
     monkeypatch.setattr(deploy.secrets, "token_hex", lambda count: "a" * (count * 2))
 
@@ -478,6 +496,7 @@ def test_native_foreground_is_default_and_generated_token_is_not_printed(monkeyp
         output=output.append,
         project_root=tmp_path / "project",
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     assert result.native_service == "foreground"
     assert result.onebot_token == "a" * 64
@@ -517,8 +536,8 @@ def test_native_init_and_foreground_use_private_umask_and_database_modes(monkeyp
 
 
 def test_docker_lock_is_held_through_declined_start_gate(tmp_path):
-    answers = iter(["1", "1", "", "", "", "", "", "", "y", "n"])
-    hidden = iter(["secret-api", "onebot-token"])
+    answers = iter(["1", "1", "", "y", "n"])
+    hidden = iter(["secret-api"])
     runner = FakeRunner()
     events: list[str] = []
 
@@ -537,6 +556,7 @@ def test_docker_lock_is_held_through_declined_start_gate(tmp_path):
         listener_checker=lambda: None,
         project_root=tmp_path,
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     create = next(i for i, (command, _) in enumerate(runner.calls) if command[:2] == ["docker", "create"])
     remove = next(i for i, (command, _) in enumerate(runner.calls) if command[:2] == ["docker", "rm"])
@@ -562,8 +582,8 @@ def test_docker_lock_creation_failure_writes_nothing(tmp_path):
 
 def test_native_session_lock_spans_second_gate_and_releases(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy.os, "geteuid", lambda: 1000)
-    answers = iter(["3", "", "1", "", "", "", "", "", "y", "n"])
-    hidden = iter(["secret-api", "onebot-token"])
+    answers = iter(["3", "", "1", "", "y", "n"])
+    hidden = iter(["secret-api"])
     events: list[str] = []
 
     class Lock:
@@ -587,6 +607,7 @@ def test_native_session_lock_spans_second_gate_and_releases(tmp_path, monkeypatc
         listener_checker=lambda: None,
         project_root=tmp_path,
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     assert events == ["acquire", "release"]
 
@@ -766,8 +787,8 @@ def test_systemd_disable_failure_is_reported(tmp_path, monkeypatch):
 
 def test_declining_second_gate_never_enables_systemd(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy.os, "geteuid", lambda: 1000)
-    answers = iter(["3", "s", "1", "", "", "", "", "", "y", "n"])
-    hidden = iter(["secret-api", "onebot-token"])
+    answers = iter(["3", "s", "1", "", "y", "n"])
+    hidden = iter(["secret-api"])
     runner = FakeRunner()
     deploy.run_wizard(
         input_fn=lambda _: next(answers),
@@ -777,6 +798,7 @@ def test_declining_second_gate_never_enables_systemd(tmp_path, monkeypatch):
         listener_checker=lambda: None,
         project_root=tmp_path,
         home=tmp_path / "home",
+        port=TEST_PORT,
     )
     assert not any(command[:3] == ["systemctl", "--user", "enable"] for command, _ in runner.calls)
 
@@ -821,3 +843,247 @@ def test_venv_swap_failure_restores_owned_old_venv(tmp_path, monkeypatch):
         deploy.promote_venv(p, staging)
     assert (p.venv_path / "old-install").read_text() == "old"
     shutil.rmtree(staging)
+
+
+# ── port selection ──────────────────────────────────────────────────────────
+
+
+def bound_port() -> tuple[socket.socket, int]:
+    """Hold a loopback port open so the collision paths have something real."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    return sock, sock.getsockname()[1]
+
+
+def test_selected_port_reaches_the_rendered_config(monkeypatch):
+    text = deploy.render_config(provider(), deploy.Features(), "data/pretender.db", 3457)
+    monkeypatch.setenv(deploy.LLM_ENV, "generic-key")
+    monkeypatch.setenv(deploy.ONEBOT_ENV, "generated-token")
+
+    cfg = Config.loads(text)
+
+    assert cfg.adapter.onebot.port == 3457
+    assert cfg.adapter.onebot.path == deploy.DEFAULT_ONEBOT_PATH
+
+
+@pytest.mark.parametrize("bad", ["", "80", "0", "65536", "http", "3001x", True, None])
+def test_port_validation_rejects_privileged_and_malformed_values(bad):
+    with pytest.raises(deploy.DeployError):
+        deploy.validate_port(bad)
+
+
+def test_find_free_port_skips_the_busy_one():
+    sock, busy = bound_port()
+    try:
+        assert deploy.port_available(busy) is False
+        assert deploy.find_free_port(busy) > busy
+    finally:
+        sock.close()
+
+
+def test_check_listener_reports_the_busy_address():
+    sock, busy = bound_port()
+    try:
+        with pytest.raises(deploy.DeployError, match=str(busy)):
+            deploy.check_listener(port=busy)
+    finally:
+        sock.close()
+    deploy.check_listener(port=busy)
+
+
+def test_wizard_offers_a_free_port_and_refuses_a_busy_one():
+    sock, busy = bound_port()
+    try:
+        messages: list[str] = []
+        prompts: list[str] = []
+        # First answer insists on the busy port; the wizard re-asks instead of
+        # writing a config that cannot bind.
+        answers = iter([str(busy), ""])
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        chosen = deploy._prompt_port(ask, messages.append, preferred=busy)
+    finally:
+        sock.close()
+    assert chosen != busy
+    assert deploy.port_available(chosen)
+    assert len(prompts) == 2
+    assert any(str(busy) in message for message in messages)
+
+
+def test_setup_uses_the_plan_port_for_the_listener_check(tmp_path, monkeypatch):
+    checked: list[int] = []
+    monkeypatch.setattr(deploy, "check_listener", lambda port=deploy.DEFAULT_PORT: checked.append(port))
+    p = replace(plan(tmp_path, "compose"), port=3456)
+
+    deploy.setup_plan(p, runner=FakeRunner())
+
+    assert checked == [3456]
+
+
+def test_plan_exposes_the_napcat_url_without_the_token(tmp_path):
+    p = replace(plan(tmp_path, "compose"), port=3456, onebot_token="super-secret-token")
+
+    text = deploy.napcat_instructions(p)
+
+    assert p.onebot_url == "ws://127.0.0.1:3456/onebot/v11/ws?message_format=array"
+    assert p.onebot_url in text
+    assert "super-secret-token" not in text
+    assert deploy.ONEBOT_ENV in text
+
+
+# ── language ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "environ,expected",
+    [
+        ({"LANG": "zh_CN.UTF-8"}, "zh"),
+        ({"LANG": "en_US.UTF-8"}, "en"),
+        ({"LC_ALL": "zh_TW.UTF-8", "LANG": "en_US.UTF-8"}, "zh"),
+        ({"LANG": "C"}, "zh"),
+        ({}, "zh"),
+        ({"PRETENDER_LANG": "en", "LANG": "zh_CN.UTF-8"}, "en"),
+    ],
+)
+def test_language_detection(environ, expected):
+    assert deploy.detect_language(environ) == expected
+
+
+def test_every_message_key_exists_in_both_languages():
+    assert set(deploy.MESSAGES["zh"]) == set(deploy.MESSAGES["en"])
+
+
+def test_unknown_message_key_falls_back_to_itself():
+    deploy.set_language("zh")
+    assert deploy.t("no.such.key") == "no.such.key"
+    assert "Docker Compose" in deploy.t("prompt.target")
+
+
+def test_unsupported_language_is_rejected():
+    with pytest.raises(deploy.DeployError):
+        deploy.set_language("fr")
+
+
+# ── non-interactive plans ───────────────────────────────────────────────────
+
+
+def test_non_interactive_plan_reads_secrets_from_the_environment(tmp_path):
+    p = deploy.plan_from_options(
+        environ={deploy.LLM_ENV: "sk-from-env", deploy.ONEBOT_ENV: "token-from-env"},
+        project_root=tmp_path / "project",
+        home=tmp_path / "home",
+        port=TEST_PORT,
+    )
+
+    assert p.provider.api_key == "sk-from-env"
+    assert p.onebot_token == "token-from-env"
+    assert p.provider.planner_model == "deepseek-chat"
+    assert p.provider.reply_model == "deepseek-chat"
+    assert p.port == TEST_PORT
+    assert deploy.plan_summary(p).count(deploy.t("summary.redacted")) == 2
+
+
+def test_non_interactive_plan_generates_a_token_when_unset(tmp_path):
+    p = deploy.plan_from_options(
+        environ={deploy.LLM_ENV: "sk-from-env"},
+        project_root=tmp_path / "project",
+        home=tmp_path / "home",
+        port=TEST_PORT,
+    )
+
+    assert len(p.onebot_token) == 64
+
+
+def test_non_interactive_plan_requires_the_api_key(tmp_path):
+    with pytest.raises(deploy.DeployError, match=deploy.LLM_ENV):
+        deploy.plan_from_options(
+            environ={},
+            project_root=tmp_path / "project",
+            home=tmp_path / "home",
+            port=TEST_PORT,
+        )
+
+
+def test_non_interactive_custom_provider_requires_a_base_url(tmp_path):
+    with pytest.raises(deploy.DeployError, match="base-url"):
+        deploy.plan_from_options(
+            provider_kind="custom",
+            environ={deploy.LLM_ENV: "sk-from-env"},
+            project_root=tmp_path / "project",
+            home=tmp_path / "home",
+            port=TEST_PORT,
+        )
+
+
+def test_prebuilt_plan_skips_every_question(tmp_path):
+    p = deploy.plan_from_options(
+        environ={deploy.LLM_ENV: "sk-from-env"},
+        project_root=tmp_path,
+        home=tmp_path / "home",
+        port=TEST_PORT,
+    )
+
+    def refuse(prompt):
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    result = deploy.run_wizard(
+        dry_run=True, plan=p, assume_yes=True, input_fn=refuse,
+        secret_fn=refuse, output=lambda _: None, runner=FakeRunner(),
+    )
+
+    assert result is p
+
+
+# ── older interpreters ──────────────────────────────────────────────────────
+
+
+def test_project_name_is_readable_without_tomllib(monkeypatch):
+    monkeypatch.setattr(deploy, "tomllib", None)
+    manifest = Path(deploy.__file__).resolve().parents[1] / "pyproject.toml"
+
+    assert deploy._manifest_project_name(manifest) == "pretender"
+    assert deploy.trusted_project_root() == manifest.parent
+
+
+def test_generated_env_and_config_agree_on_the_port_and_secrets(tmp_path, monkeypatch):
+    """The two generated files have to work together: the config references
+    env names, the .env supplies them, and both name the chosen port."""
+
+    answers = iter(["1", "1", "", "y", "n"])
+    hidden = iter(["sk-live-key"])
+    monkeypatch.setattr(deploy.secrets, "token_hex", lambda count: "b" * (count * 2))
+
+    p = deploy.run_wizard(
+        input_fn=lambda _: next(answers),
+        secret_fn=lambda _: next(hidden),
+        output=lambda _: None,
+        runner=FakeRunner(),
+        listener_checker=lambda: None,
+        project_root=tmp_path,
+        home=tmp_path / "home",
+        port=3457,
+    )
+
+    assert p is not None
+    environment = dict(
+        line.split("=", 1)
+        for line in p.environment_path.read_text().splitlines()
+        if "=" in line and not line.startswith("#")
+    )
+    assert environment[deploy.LLM_ENV] == "sk-live-key"
+    assert environment[deploy.ONEBOT_ENV] == "b" * 64
+    assert p.environment_path.stat().st_mode & 0o777 == 0o600
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    cfg = Config.loads(p.config_path.read_text())
+
+    assert cfg.adapter.onebot.port == 3457
+    assert cfg.adapter.onebot.access_token == "b" * 64
+    assert cfg.llm.profile("planner").api_key == "sk-live-key"
+    assert "sk-live-key" not in p.config_path.read_text()

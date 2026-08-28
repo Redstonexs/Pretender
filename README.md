@@ -4,6 +4,54 @@ Pretender 是面向群聊的 Python LLM Agent：记录收到的事件，判断�
 回复，并通过本地控制台或显式启用的 OneBot v11 适配器生成回复。它把
 SQLite ledger、JSONL corpus 和 outbox 作为可恢复的持久状态。
 
+## 快速开始（三步部署）
+
+前提：一台原生 Linux 主机、已安装 Docker Engine + Compose v2、同机已登录的
+NapCat/OneBot、一个 LLM 提供商的 API key。
+
+**1. 运行一键部署脚本**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Redstonexs/Pretender/main/deploy.sh | sh
+```
+
+已经克隆过仓库就直接 `./deploy.sh`。向导默认中文（`--lang en` 切英文），只问四个问题：
+部署方式、提供商、模型、端口——除 API key 外全部有默认值，一路回车即可。3001
+被占用时会自动探测并改用下一个空闲端口，并告诉你是谁占着它。
+
+**2. 按向导提示配置 NapCat**
+
+向导会打印现成的连接地址，例如：
+
+```
+ws://127.0.0.1:3001/onebot/v11/ws?message_format=array
+```
+
+访问令牌用 `./deploy.sh token` 查看，填入 NapCat 后保存。`message_format=array`
+必须保留。
+
+**3. 回到向导确认启动**
+
+NapCat 连上后回到向导，确认启动即可。之后的日常操作：
+
+```sh
+./deploy.sh logs       # 跟随日志
+./deploy.sh status     # 查看容器状态与连接地址
+./deploy.sh stop       # 停止
+./deploy.sh start      # 启动
+./deploy.sh update     # 拉取新镜像并重启
+./deploy.sh token      # 打印 OneBot token
+```
+
+无人值守部署（密钥只从环境变量读取，不进 `ps` 和 shell 历史）：
+
+```sh
+PRETENDER_LLM_API_KEY=sk-... ./deploy.sh --non-interactive --port 3010
+```
+
+想逐项确认全部选项（回复模型、分段/错别字/媒体开关、镜像 tag）用 `./deploy.sh --advanced`；
+只看方案不落盘用 `--dry-run`。完整部署说明见下面的 [Docker 部署](#docker-部署)。
+
 ## 安装
 
 需要 Python 3.11 或更高版本：
@@ -87,21 +135,61 @@ cd Pretender
 
 ### 一键部署向导
 
-在仓库根目录运行：
+在仓库根目录运行 `./deploy.sh`（等价于 `python3 scripts/deploy.py`，只需要 Python 3.9+）。
 
-```sh
-python3 scripts/deploy.py
-```
+向导只使用仓库内受信任的文件，不使用调用者当前工作目录中的同名文件。默认（快捷）路径
+只问四个问题：部署方式（Docker Compose / `docker run` / 本机原生）、提供商、模型 ID、
+OneBot 端口，再加一次不回显的 API key 输入。回复模型默认与规划模型相同，OneBot token
+自动生成，分段/错别字/媒体开关与镜像 tag 使用默认值——需要逐项确认时加 `--advanced`。
 
-向导只使用仓库内受信任的文件，不使用调用者当前工作目录中的同名文件。它会交互选择
-Docker Compose、`docker run` 或原生主机部署，选择提供商以及 planner/reply 模型 ID（包括
-自定义兼容端点），并选择 split、typo、media 三项功能开关。向导先展示计划并请求确认，
-确认后才写入受保护的环境变量和配置文件，并执行离线校验；随后暂停，让操作者把 OneBot
-token 复制到 NapCat，再要求**第二次明确确认**，确认后才进行任何 live 启动。Docker 模式
-会拒绝与另一种 Docker 模式并发使用共享数据卷；原生主机模式默认前台运行，也可选择
-systemd user service。使用 `--dry-run` 可预览流程，不写入文件、不执行子进程，并会遮盖密钥。
+向导先展示计划并请求确认，确认后才写入受保护的环境变量和配置文件，并执行离线校验；随后
+打印现成的 NapCat 连接地址并暂停，让操作者完成 NapCat 配置，再要求**第二次明确确认**，
+确认后才进行任何 live 启动。Docker 模式会拒绝与另一种 Docker 模式并发使用共享数据卷；
+原生主机模式默认前台运行，也可选择 systemd user service。
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--lang zh\|en` | 向导语言，默认按 locale 自动判断（无法判断时用中文）。 |
+| `--port N` | 指定 OneBot 反向 WebSocket 端口，跳过端口提问。 |
+| `--advanced` | 询问全部选项，而不是给可选项填默认值。 |
+| `--non-interactive` | 完全由参数和环境变量构建方案，不提任何问题。 |
+| `--yes` / `--start` | 分别跳过“写入配置”与“启动 live”两道确认。 |
+| `--dry-run` | 只展示方案；不写文件、不执行子进程，密钥全部遮盖。 |
+| `--force` | 覆盖向导自己生成过的文件（先备份）。 |
+
+非交互模式的密钥只从环境变量读取（默认 `PRETENDER_LLM_API_KEY` 和
+`ONEBOT_ACCESS_TOKEN`，可用 `--api-key-env` / `--token-env` 改名），因为命令行参数会出现在
+`ps` 输出和 shell 历史里。`ONEBOT_ACCESS_TOKEN` 未设置时自动生成一个。
+
 向导只支持 split、typo、media 目录；harvesting、vision、embed、learn、plugins 等需手动
 使用高级配置，向导不会生成这些配置。
+
+### 端口冲突
+
+3001 是最容易撞车的一环（另一个 OneBot 桥接、某个开发服务器等）。现在三处都会处理：
+
+- 向导启动时探测 3001，被占用就自动改用往上第一个空闲端口，并打印占用它的进程名和 pid；
+  手动填一个已被占用的端口会被拒绝并重新询问。
+- 手动部署时改 `config/config.toml` 里的 `adapter.onebot.port`，NapCat 的连接地址要改成
+  同一个端口。因为用的是 host 网络，不需要也不要配置 `ports:`。
+- 运行时端口无法绑定会报出具体地址、占用原因和修复方式，而不是一个裸的 errno。
+
+用 `./deploy.sh status` 可以随时看到当前配置的连接地址。
+
+### 日常运维
+
+```sh
+./deploy.sh logs       # 跟随日志
+./deploy.sh status     # 容器状态 + 当前连接地址
+./deploy.sh start      # 启动（自动创建数据卷）
+./deploy.sh stop       # 停止
+./deploy.sh restart    # 重启
+./deploy.sh update     # 拉取新镜像并重启
+./deploy.sh token      # 打印 OneBot token
+./deploy.sh uninstall  # 停止并移除容器，保留 pretender-data 数据卷
+```
 
 ### 准备配置
 
@@ -116,13 +204,14 @@ chmod 600 .env
 不是 Docker 快速部署模板；快速部署应使用 `config.docker.example.toml`。最小配置使用镜像
 内置的 prompts，不需要创建或挂载 `prompts` 目录。
 
-创建一次供两种部署方式共用的外部数据卷：
+创建一次供两种部署方式共用的外部数据卷（`./deploy.sh` 和 `./deploy.sh start` 会自动创建）：
 
 ```sh
 docker volume create pretender-data
 ```
 
-该卷由 `docker run` 和 Docker Compose 共用，用于持久化 SQLite 数据。
+该卷由 `docker run` 和 Docker Compose 共用，用于持久化 SQLite 数据。外部卷意味着
+`docker compose down -v` 也不会删除它。
 
 ### .env 怎么填
 
@@ -150,8 +239,10 @@ token。
 ### 配置 NapCat
 
 在启动 Pretender **之前**，让同机已登录的 NapCat/OneBot 连接到：
-`ws://127.0.0.1:3001/onebot/v11/ws?message_format=array`。连接选项必须使用
-`message_format=array`，并配置与 `.env` 完全相同的 `ONEBOT_ACCESS_TOKEN`。
+`ws://127.0.0.1:<端口>/onebot/v11/ws?message_format=array`，其中 `<端口>` 是
+`config/config.toml` 里 `adapter.onebot.port` 的值（默认 3001，向导会打印实际值，
+`./deploy.sh status` 也能查到）。连接选项必须使用 `message_format=array`，并配置与
+`.env` 完全相同的 `ONEBOT_ACCESS_TOKEN`。
 
 **二选一：**使用下面的 `docker run` 或 Docker Compose 其中一种，不能同时运行两者；两者
 共享 SQLite 数据卷。
@@ -236,7 +327,7 @@ release tag。
 
 #### 网络与安全
 
-当前 `reverse_ws` 配置刻意只绑定 `127.0.0.1:3001`，因此两种方式都需要原生 Linux host
+当前 `reverse_ws` 配置刻意只绑定 `127.0.0.1`（端口见配置），因此两种方式都需要原生 Linux host
 网络，并要求 NapCat/OneBot 与容器在同一台主机上；不要配置或发布 `ports`。Docker Desktop
 和普通端口映射不适用于此配置。使用 forward `ws`/`wss` 的用户可以在自己的 Compose
 override 中移除 host 网络，但不得在没有 TLS 能力的情况下将 `reverse_ws` 暴露到外部。

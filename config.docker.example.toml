@@ -19,6 +19,8 @@ name = "onebot"
 [adapter.onebot]
 mode = "reverse_ws"
 host = "127.0.0.1"
+# 3001 很容易被其他程序占用。改这里的端口后，NapCat 的连接地址要改成同一个端口。
+# Port 3001 collides often. Change it here and point NapCat at the same port.
 port = 3001
 path = "/onebot/v11/ws"
 access_token = "${ONEBOT_ACCESS_TOKEN}"
