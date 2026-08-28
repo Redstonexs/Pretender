@@ -1,11 +1,13 @@
 services:
   pretender:
     image: "${PRETENDER_IMAGE:?set PRETENDER_IMAGE in .env to a pinned release image}"
+    labels:
+      io.pretender.wizard-managed: "true"
     restart: unless-stopped
     stop_grace_period: 30s
     env_file: .env
     environment:
-      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}"
+      PRETENDER_LLM_API_KEY: "${PRETENDER_LLM_API_KEY:?set PRETENDER_LLM_API_KEY in .env}"
       ONEBOT_ACCESS_TOKEN: "${ONEBOT_ACCESS_TOKEN:?set ONEBOT_ACCESS_TOKEN in .env}"
     network_mode: host
     volumes:

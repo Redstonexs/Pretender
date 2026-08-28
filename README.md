@@ -70,7 +70,7 @@ python -m pytest
 - 原生 Linux 主机；提供的 `reverse_ws` 拓扑不支持 Docker Desktop 或普通端口映射。
 - 已安装 Docker Engine 和 Docker Compose v2。
 - 与容器同一台主机上的 NapCat/OneBot 实例，且已登录。
-- 一个在 DeepSeek 控制台创建的 API key。
+- 一个 LLM 提供商的 API key；默认配置使用在 DeepSeek 控制台创建的 API key。
 
 ### 部署文件在哪里 / 从零开始
 
@@ -84,6 +84,24 @@ cd Pretender
 ```
 
 以下所有命令都在包含上述文件的仓库根目录运行。
+
+### 一键部署向导
+
+在仓库根目录运行：
+
+```sh
+python3 scripts/deploy.py
+```
+
+向导只使用仓库内受信任的文件，不使用调用者当前工作目录中的同名文件。它会交互选择
+Docker Compose、`docker run` 或原生主机部署，选择提供商以及 planner/reply 模型 ID（包括
+自定义兼容端点），并选择 split、typo、media 三项功能开关。向导先展示计划并请求确认，
+确认后才写入受保护的环境变量和配置文件，并执行离线校验；随后暂停，让操作者把 OneBot
+token 复制到 NapCat，再要求**第二次明确确认**，确认后才进行任何 live 启动。Docker 模式
+会拒绝与另一种 Docker 模式并发使用共享数据卷；原生主机模式默认前台运行，也可选择
+systemd user service。使用 `--dry-run` 可预览流程，不写入文件、不执行子进程，并会遮盖密钥。
+向导只支持 split、typo、media 目录；harvesting、vision、embed、learn、plugins 等需手动
+使用高级配置，向导不会生成这些配置。
 
 ### 准备配置
 
@@ -113,7 +131,7 @@ docker volume create pretender-data
 | 变量 | 填写方式 |
 | --- | --- |
 | `PRETENDER_IMAGE` | 填一个已发布的 GHCR release tag，例如 `ghcr.io/redstonexs/pretender:v1.0.2`；不要使用 `latest`。`docker run` 中的 `IMAGE` 必须使用完全相同的 tag。 |
-| `DEEPSEEK_API_KEY` | 填在 DeepSeek 控制台创建的 API key；不要把真实值写入或粘贴到 README。 |
+| `PRETENDER_LLM_API_KEY` | 填所选 LLM 提供商的 API key；默认模板以 DeepSeek 为例，但变量名是通用的。不要把真实值写入或粘贴到 README。 |
 | `ONEBOT_ACCESS_TOKEN` | 执行 `openssl rand -hex 32` 生成，填入 `.env`，并在 NapCat 中配置相同 token。 |
 
 基础部署不需要 `DASHSCOPE_API_KEY` 或 `SILICONFLOW_API_KEY`。只有在高级配置中手动启用

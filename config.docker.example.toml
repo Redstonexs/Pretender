@@ -5,12 +5,12 @@ name = "麦麦"
 
 [llm.profiles.planner]
 base_url = "https://api.deepseek.com/v1"
-api_key = "${DEEPSEEK_API_KEY}"
+api_key = "${PRETENDER_LLM_API_KEY}"
 model = "deepseek-chat"
 
 [llm.profiles.reply]
 base_url = "https://api.deepseek.com/v1"
-api_key = "${DEEPSEEK_API_KEY}"
+api_key = "${PRETENDER_LLM_API_KEY}"
 model = "deepseek-chat"
 
 [adapter]

@@ -81,7 +81,7 @@ def test_sample_toml_loads_with_env(monkeypatch, sample_config_path):
 
 
 def test_docker_example_is_minimal_live_config(monkeypatch, sample_config_path):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-docker-test")
+    monkeypatch.setenv("PRETENDER_LLM_API_KEY", "llm-docker-test")
     monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "ob-docker-test")
 
     cfg = load_config(sample_config_path.parent / "config.docker.example.toml")
@@ -89,10 +89,10 @@ def test_docker_example_is_minimal_live_config(monkeypatch, sample_config_path):
     assert set(cfg.llm.profiles) == {"planner", "reply"}
     assert cfg.llm.profile("planner").base_url == "https://api.deepseek.com/v1"
     assert cfg.llm.profile("planner").model == "deepseek-chat"
-    assert cfg.llm.profile("planner").api_key == "sk-docker-test"
+    assert cfg.llm.profile("planner").api_key == "llm-docker-test"
     assert cfg.llm.profile("reply").base_url == "https://api.deepseek.com/v1"
     assert cfg.llm.profile("reply").model == "deepseek-chat"
-    assert cfg.llm.profile("reply").api_key == "sk-docker-test"
+    assert cfg.llm.profile("reply").api_key == "llm-docker-test"
     assert cfg.adapter.name == "onebot"
     assert cfg.adapter.onebot.mode == "reverse_ws"
     assert cfg.adapter.onebot.host == "127.0.0.1"
