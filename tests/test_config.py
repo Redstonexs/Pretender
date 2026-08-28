@@ -94,6 +94,30 @@ def test_env_expansion_missing_variable_raises(monkeypatch):
         Config.loads('[llm.profiles.planner]\napi_key = "${PRETENDER_NEVER_SET}"')
 
 
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_llm_api_key_env_value_rejected(monkeypatch, value):
+    monkeypatch.setenv("PRETENDER_BLANK_API_KEY", value)
+    with pytest.raises(ConfigError, match="PRETENDER_BLANK_API_KEY"):
+        Config.loads(
+            '[llm.profiles.planner]\napi_key = "${PRETENDER_BLANK_API_KEY}"'
+        )
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_onebot_access_token_env_value_rejected(monkeypatch, value):
+    monkeypatch.setenv("PRETENDER_BLANK_ACCESS_TOKEN", value)
+    with pytest.raises(ConfigError, match="PRETENDER_BLANK_ACCESS_TOKEN"):
+        Config.loads(
+            '[adapter.onebot]\naccess_token = "${PRETENDER_BLANK_ACCESS_TOKEN}"'
+        )
+
+
+def test_non_secret_empty_env_value_remains_allowed(monkeypatch):
+    monkeypatch.setenv("PRETENDER_EMPTY_BOT_NAME", "")
+    cfg = Config.loads('[bot]\nname = "${PRETENDER_EMPTY_BOT_NAME}"')
+    assert cfg.bot.name == ""
+
+
 def test_literal_api_key_rejected_at_load():
     """Secrets must resolve from ${ENV}: a literal api_key value is a
     ConfigError at load time, never silently accepted."""

@@ -64,108 +64,90 @@ python -m pytest
 
 ## Docker 部署
 
-以下方式都把配置文件挂载到 `/config/config.toml`，并从
-`/config/prompts` 读取相对 prompt 文件。先准备目录和配置：
+当前示例配置使用 `reverse_ws`，生产部署需要原生 Linux。准备目录、配置和环境文件：
 
 ```sh
-mkdir -p config prompts data logs
+mkdir -p config prompts
 cp config.example.toml config/config.toml
-export DEEPSEEK_API_KEY=...
-export DASHSCOPE_API_KEY=...
-export SILICONFLOW_API_KEY=...
-export ONEBOT_ACCESS_TOKEN=...
+cp .env.example .env
 ```
 
-### Compose：本地源码镜像
+编辑 `config/config.toml` 和 `.env`。示例配置引用以下四个变量，四者都必须在 `.env`
+中提供：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`SILICONFLOW_API_KEY`、
+`ONEBOT_ACCESS_TOKEN`。`.env` 未被 Git 跟踪，请勿提交真实密钥。
 
-构建并启动当前源码：
+### docker run
 
-```sh
-docker compose build
-docker compose run --rm pretender init
-docker compose up -d
-```
-
-### Compose：已发布的 GHCR 镜像
-
-使用发布版本时指定明确的 release tag；不要在生产环境默认使用 `latest`：
-
-```sh
-export PRETENDER_IMAGE=ghcr.io/redstonexs/pretender:v1.0.2
-docker compose pull
-docker compose run --rm pretender init
-docker compose up -d --no-build
-```
-
-此路径不要运行 `docker compose build`，否则会改为构建本地源码镜像。
-
-查看日志或优雅停止 Compose 服务：
-
-```sh
-docker compose logs -f pretender
-# 保留容器，后续可用 `docker compose start` 恢复
-docker compose stop
-# 停止并移除容器；data/ 和 logs/ 绑定挂载会保留
-docker compose down
-```
-
-镜像默认执行 `pretender run --live --config /config/config.toml`。Compose 将
-`./config` 和 `./prompts` 以只读方式挂载，将 `./data`（SQLite、JSONL corpus、
-embedding cache）和 `./logs` 挂载到容器。当前运行时的普通日志写入 stdout，不会主动
-将 JSONL 日志写入该挂载目录。请在首次启动前
-由宿主用户创建 `data`、`logs` 目录；若目录属其他 UID，请调整其写权限。
-密钥只在运行时从环境变量传入，不会写入镜像。
-
-### Docker：发布镜像生产部署
-
-下面是使用 GHCR 发布镜像的独立流程。将 `IMAGE` 替换为实际发布的 release tag；生产环境
-不要默认改用 `latest`：
+使用明确的 release tag；生产环境不要使用 `latest`：
 
 ```sh
 IMAGE=ghcr.io/redstonexs/pretender:v1.0.2
-
 docker pull "$IMAGE"
+docker volume create pretender-data
 
-# 仅首次运行：初始化数据目录
-docker run --rm \
-  --network host \
-  --user "$(id -u):$(id -g)" \
-  --env DEEPSEEK_API_KEY \
-  --env DASHSCOPE_API_KEY \
-  --env SILICONFLOW_API_KEY \
-  --env ONEBOT_ACCESS_TOKEN \
-  -v "$PWD/config/config.toml:/config/config.toml:ro" \
-  -v "$PWD/prompts:/config/prompts:ro" \
-  -v "$PWD/data:/config/data" \
-  -v "$PWD/logs:/config/logs" \
-  "$IMAGE" init
-
-# 后台运行
 docker run -d --name pretender \
   --restart unless-stopped \
   --network host \
-  --user "$(id -u):$(id -g)" \
-  --env DEEPSEEK_API_KEY \
-  --env DASHSCOPE_API_KEY \
-  --env SILICONFLOW_API_KEY \
-  --env ONEBOT_ACCESS_TOKEN \
-  -v "$PWD/config/config.toml:/config/config.toml:ro" \
-  -v "$PWD/prompts:/config/prompts:ro" \
-  -v "$PWD/data:/config/data" \
-  -v "$PWD/logs:/config/logs" \
-  "$IMAGE" run --live
+  --env-file .env \
+  --mount "type=bind,src=$PWD/config/config.toml,dst=/config/config.toml,readonly" \
+  --mount "type=bind,src=$PWD/prompts,dst=/config/prompts,readonly" \
+  --mount type=volume,source=pretender-data,target=/config/data \
+  "$IMAGE" run --live --config /config/config.toml
+```
 
+查看日志并优雅停止：
+
+```sh
 docker logs -f pretender
 docker stop -t 10 pretender
 docker rm pretender
 ```
 
-`init` 和运行命令都使用宿主用户、host 网络以及相同的配置、prompt、数据和日志挂载。
-命令不需要显式添加 `--config`，镜像 entrypoint 会提供 `/config/config.toml`。
+### Docker Compose
 
-示例配置的 `adapter.onebot.mode = "reverse_ws"` 使用仅回环绑定
-`127.0.0.1:3001`。因此 Compose 使用 `network_mode: host` 且不发布任何
-`ports`；这要求 Linux 宿主机，并要求 NapCat/OneBot 与容器运行在同一台
-宿主机上，通过 `ws://127.0.0.1:3001/onebot/v11/ws?message_format=array` 回连。该模式不能用
-Docker Desktop 的普通端口映射替代；远程连接应先在宿主机配置本地 TLS 反向
-代理。
+Compose 使用 `.env` 中固定的 `PRETENDER_IMAGE`，配置和 prompt 只读挂载到容器，数据保存
+在 `pretender-data` 命名卷中。镜像为预构建发布镜像，不要执行 build：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+查看日志或停止服务：
+
+```sh
+docker compose logs -f pretender
+docker compose stop
+docker compose down
+```
+
+启动时会自动创建或升级数据库 schema；`init` 仅用于可选的离线预检或升级，例如：
+
+```sh
+docker compose run --rm pretender init --config /config/config.toml
+```
+
+#### 更新
+
+只在 `.env` 中将 `PRETENDER_IMAGE` 改为明确的 release tag，然后拉取并重启：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+升级前请备份 `pretender-data` 命名卷中的数据。SQLite 不支持多个副本同时写入，勿运行
+多个 Pretender replicas。
+
+#### 网络与安全
+
+当前 `reverse_ws` 配置刻意只绑定 `127.0.0.1:3001`，因此 Docker run 和 Compose 都使用
+host 网络，并要求 NapCat/OneBot 与容器在同一台原生 Linux 主机上；不发布 `ports`。
+Docker Desktop 或普通端口映射不适用于此配置。使用 forward `ws`/`wss` 的用户可以在自己
+的 Compose override 中移除 host 网络，但不得在没有 TLS 能力的情况下将 `reverse_ws` 暴露
+到外部。
+
+#### 本地镜像（仅开发）
+
+如需验证本地代码，可先执行 `docker build -t pretender:dev .`，再将 `docker run` 中的
+`IMAGE` 或 `.env` 中的 `PRETENDER_IMAGE` 替换为 `pretender:dev`；这不是生产发布流程。

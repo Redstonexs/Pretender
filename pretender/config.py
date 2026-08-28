@@ -915,7 +915,13 @@ def _expand_env(value: Any, path: str = "") -> Any:
                 raise ConfigError(
                     f"environment variable {name!r} referenced in config is not set"
                 )
-            return os.environ[name]
+            resolved = os.environ[name]
+            if _is_secret_path(path) and not resolved.strip():
+                raise ConfigError(
+                    f"environment variable {name!r} referenced for secret "
+                    f"{path!r} must not be empty or whitespace-only"
+                )
+            return resolved
         if _is_secret_path(path):
             raise ConfigError(
                 f"secret {path!r} must be a ${{ENV}} reference, "

@@ -1,20 +1,20 @@
 services:
   pretender:
-    image: "${PRETENDER_IMAGE:-pretender:latest}"
-    build:
-      context: .
-      dockerfile: Dockerfile
-    working_dir: /config
-    network_mode: host
-    user: "${UID:-1000}:${GID:-1000}"
+    image: "${PRETENDER_IMAGE:?set PRETENDER_IMAGE in .env to a pinned release image}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file: .env
     environment:
-      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
-      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:-}"
-      SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:-}"
-      ONEBOT_ACCESS_TOKEN: "${ONEBOT_ACCESS_TOKEN:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:?set DASHSCOPE_API_KEY in .env}"
+      SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:?set SILICONFLOW_API_KEY in .env}"
+      ONEBOT_ACCESS_TOKEN: "${ONEBOT_ACCESS_TOKEN:?set ONEBOT_ACCESS_TOKEN in .env}"
+    network_mode: host
     volumes:
-      - ./config:/config:ro
+      - ./config/config.toml:/config/config.toml:ro
       - ./prompts:/config/prompts:ro
-      - ./data:/config/data
-      - ./logs:/config/logs
-    command: ["run", "--live"]
+      - pretender-data:/config/data
+    command: ["run", "--live", "--config", "/config/config.toml"]
+
+volumes:
+  pretender-data:

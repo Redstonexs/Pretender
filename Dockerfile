@@ -16,7 +16,4 @@ RUN python -m pip install --no-cache-dir . \
 USER pretender
 WORKDIR /config
 
-# Keep the config path fixed while allowing `docker compose run ... init` to
-# replace the default command without repeating the config argument.
-ENTRYPOINT ["sh", "-c", "exec pretender \"$@\" --config /config/config.toml", "pretender"]
-CMD ["run", "--live"]
+ENTRYPOINT ["pretender"]
