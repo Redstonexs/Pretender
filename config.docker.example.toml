@@ -1,0 +1,27 @@
+# Minimal live configuration for the Docker deployment.
+
+[bot]
+name = "麦麦"
+
+[llm.profiles.planner]
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-chat"
+
+[llm.profiles.reply]
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-chat"
+
+[adapter]
+name = "onebot"
+
+[adapter.onebot]
+mode = "reverse_ws"
+host = "127.0.0.1"
+port = 3001
+path = "/onebot/v11/ws"
+access_token = "${ONEBOT_ACCESS_TOKEN}"
+
+[storage]
+db_path = "data/pretender.db"

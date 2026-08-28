@@ -6,15 +6,14 @@ services:
     env_file: .env
     environment:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in .env}"
-      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:?set DASHSCOPE_API_KEY in .env}"
-      SILICONFLOW_API_KEY: "${SILICONFLOW_API_KEY:?set SILICONFLOW_API_KEY in .env}"
       ONEBOT_ACCESS_TOKEN: "${ONEBOT_ACCESS_TOKEN:?set ONEBOT_ACCESS_TOKEN in .env}"
     network_mode: host
     volumes:
       - ./config/config.toml:/config/config.toml:ro
-      - ./prompts:/config/prompts:ro
       - pretender-data:/config/data
     command: ["run", "--live", "--config", "/config/config.toml"]
 
 volumes:
   pretender-data:
+    name: pretender-data
+    external: true
