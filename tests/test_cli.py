@@ -888,3 +888,51 @@ def test_cli_contains_no_sql_text():
         assert not re.search(rf"\b{keyword}\b", text), (
             f"SQL keyword {keyword!r} found in cli.py"
         )
+
+
+# ── logging is actually installed ───────────────────────────────────────────
+#
+# ``setup_logging`` existed and was tested for two phases without ever being
+# called from production code. The ``pretender`` logger therefore had no
+# handler and inherited root's WARNING level, so every INFO line — adapter
+# readiness, gate decisions, outbox sends — was discarded and ``docker logs``
+# stayed empty. A bot that silently never replies and emits nothing at all is
+# undiagnosable; this test is what keeps the wiring in place.
+
+def test_run_installs_the_configured_log_handlers(tmp_path, monkeypatch):
+    import logging
+
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        f'[storage]\ndb_path = "{tmp_path / "log.db"}"\n'
+        f'[log]\ndir = "{tmp_path / "logs"}"\nlevel = "INFO"\n',
+        encoding="utf-8",
+    )
+    main(["init", "--config", str(cfg_path)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert main(["run", "--dry-run", "--config", str(cfg_path)]) == 0
+
+    logger = logging.getLogger("pretender")
+    assert logger.handlers, "run must install handlers, not leave the logger bare"
+    assert logger.level == logging.INFO
+    logger.info("probe line")
+    written = (tmp_path / "logs" / "pretender.jsonl").read_text(encoding="utf-8")
+    assert json.loads(written.splitlines()[-1])["msg"] == "probe line"
+
+
+def test_run_degrades_to_stderr_when_the_log_dir_is_unusable(tmp_path, monkeypatch):
+    """Losing the log file is recoverable; refusing to boot is not."""
+    import logging
+
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text(
+        f'[storage]\ndb_path = "{tmp_path / "log2.db"}"\n'
+        f'[log]\ndir = "{blocker}"\nlevel = "INFO"\n',
+        encoding="utf-8",
+    )
+    main(["init", "--config", str(cfg_path)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert main(["run", "--dry-run", "--config", str(cfg_path)]) == 0
+    assert logging.getLogger("pretender").handlers

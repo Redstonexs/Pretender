@@ -13,7 +13,7 @@ import time
 import pytest
 
 from pretender.clock import VirtualClock
-from pretender.scheduler import LedgerScheduler, Scheduler
+from pretender.scheduler import MAX_IDENTICAL_REARMS, LedgerScheduler, Scheduler
 from pretender.session import backoff_seconds
 from pretender.types import (
     ChatKey,
@@ -1169,3 +1169,58 @@ def test_ledger_handler_exception_schedules_busy_recovery_without_input():
         await sched.stop()
 
     run(scenario())
+
+
+# ── the identical-re-arm loop breaker ───────────────────────────────────────
+#
+# A gate whose delay arithmetic does not converge re-arms the same wake
+# forever with no new input. Production wrote 3,660 timer dispatches over
+# 12.8 h at a fixed 11.4375 s before anyone noticed, because nothing bounded
+# the repetition. The gate's own guards are the fix; this is the containment
+# boundary for any future divergence.
+
+def _release(sched, decision):
+    """One dispatch release, exactly as the run loop performs it: the popped
+    heap entry is cleared from ``next_wake`` before the handler's decision is
+    re-armed."""
+    sched._next_wake.pop(CK_A, None)
+    sched._rearm(CK_A, decision)
+    return sched.next_wake(CK_A)
+
+
+def test_identical_rearms_fall_through_to_event_only():
+    clock = VirtualClock(epoch=EPOCH, auto_advance=False)
+    sched = LedgerScheduler(FakeLedgerRepo(), clock, FakeDispatchHandler())
+    stuck = Decision(action="delay", delay_seconds=11.4375, pending=7, score=38.0,
+                     reason="delay")
+
+    for attempt in range(MAX_IDENTICAL_REARMS):
+        assert _release(sched, stuck) == pytest.approx(EPOCH + 11.4375), attempt
+
+    # The cap is exhausted: no further timed wake is scheduled, and the chat
+    # stays wakeable by events.
+    assert _release(sched, stuck) is None
+
+
+def test_a_changed_decision_restarts_the_rearm_budget():
+    """Only a decision that repeats byte-for-byte counts — a delay that is
+    actually converging keeps its timed wakes."""
+    clock = VirtualClock(epoch=EPOCH, auto_advance=False)
+    sched = LedgerScheduler(FakeLedgerRepo(), clock, FakeDispatchHandler())
+    for seconds in (40.0, 30.0, 20.0, 10.0, 5.0, 2.0):
+        decision = Decision(action="delay", delay_seconds=seconds)
+        assert _release(sched, decision) == pytest.approx(EPOCH + seconds)
+
+
+def test_new_input_clears_the_rearm_budget():
+    """A commit that arrives while the chat is spinning is real progress: the
+    streak resets so the chat is not left event-only after it."""
+    clock = VirtualClock(epoch=EPOCH, auto_advance=False)
+    sched = LedgerScheduler(FakeLedgerRepo(), clock, FakeDispatchHandler())
+    stuck = Decision(action="delay", delay_seconds=11.4375, pending=7)
+    for _ in range(MAX_IDENTICAL_REARMS):
+        _release(sched, stuck)
+
+    sched._re_evaluate[CK_A] = DispatchCause.INBOUND
+    assert _release(sched, stuck) == pytest.approx(EPOCH)  # immediate re-run
+    assert _release(sched, stuck) == pytest.approx(EPOCH + 11.4375)

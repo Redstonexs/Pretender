@@ -13,9 +13,16 @@ services:
     volumes:
       - ./config/config.toml:/config/config.toml:ro
       - pretender-data:/config/data
+      # The JSONL log is also echoed to stdout, but /config/logs lives in the
+      # container's writable layer and would be lost on every recreate.
+      - pretender-logs:/config/logs
     command: ["run", "--live", "--config", "/config/config.toml"]
 
 volumes:
   pretender-data:
     name: pretender-data
     external: true
+  # Regenerable, so Compose-managed: unlike pretender-data there is nothing
+  # here worth surviving a `compose down -v`.
+  pretender-logs:
+    name: pretender-logs

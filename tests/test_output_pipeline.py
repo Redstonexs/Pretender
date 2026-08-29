@@ -18,7 +18,9 @@ def _out(text: str, **kw) -> Outgoing:
 def test_builtins_registered_in_order():
     pipe = OutputPipeline()
     assert pipe.names() == ("sanitize", "split", "typo")
-    assert [s.name for s in pipe.stages()] == ["split", "typo", "sanitize"]
+    # The configured order is honoured verbatim, so split and typo see
+    # cleaned text; the core sanitizer still closes the pipeline.
+    assert [s.name for s in pipe.stages()] == ["sanitize", "split", "typo", "sanitize"]
 
 
 def test_stages_satisfy_outputstage_protocol():
@@ -28,10 +30,10 @@ def test_stages_satisfy_outputstage_protocol():
 
 
 def test_config_pipeline_reorders_stages():
-    # Optional stages retain configured order; core sanitize is final.
+    # Every configured stage keeps its place; core sanitize is final.
     cfg = OutputConfig(pipeline=("sanitize", "typo", "split"))
     pipe = OutputPipeline(cfg)
-    assert [s.name for s in pipe.stages()] == ["typo", "split", "sanitize"]
+    assert [s.name for s in pipe.stages()] == ["sanitize", "typo", "split", "sanitize"]
 
 
 def test_unknown_stage_in_pipeline_raises():
@@ -43,7 +45,7 @@ def test_unknown_stage_in_pipeline_raises():
         pipe.stages()
 
 
-def test_split_before_configured_sanitize_is_repaired_to_core_final():
+def test_configured_trailing_sanitize_is_not_run_twice():
     cfg = OutputConfig(pipeline=("split", "sanitize"))
     pipe = OutputPipeline(cfg)
     assert [s.name for s in pipe.stages()] == ["split", "sanitize"]
@@ -68,17 +70,21 @@ def test_sanitize_only_pipeline_is_safe():
 
 
 def test_run_repairs_unsafe_pipeline_with_core_final():
+    """Splitting before sanitize still ends with the safety boundary, so
+    leaked markup never survives even in a hand-rolled pipeline order."""
     cfg = OutputConfig(pipeline=("split", "sanitize"))
     pipe = OutputPipeline(cfg)
-    out = _out("第一句。第二句！")
+    out = _out("第一句。第二句[CQ:at,qq=1]！")
     pipe.run(out)
-    assert out.parts == ["第一句。", "第二句！"]
+    assert "CQ:" not in "".join(out.parts or [out.text])
 
 
 def test_empty_pipeline_falls_back_to_order():
     cfg = OutputConfig(pipeline=())
     pipe = OutputPipeline(cfg)
-    assert [s.name for s in pipe.stages()] == ["split", "typo", "sanitize"]
+    assert [s.name for s in pipe.stages()] == [
+        "sanitize", "split", "typo", "sanitize",
+    ]
 
 
 def test_register_and_replace():
@@ -130,9 +136,12 @@ def test_register_shape_violation_raises():
 
 def test_run_applies_sanitize_then_split():
     pipe = OutputPipeline()
-    out = _out("第一句。第二句！第三句？")
+    out = _out("第一句。第二句！第三句？第四句。第五句！", idem_key="k")
     pipe.run(out)
-    assert out.parts == ["第一句。", "第二句！", "第三句？"]
+    # The exact bubbles are probabilistic (see tests/test_output_split.py);
+    # what the pipeline owes is that split ran and lost no content.
+    assert out.parts is not None and len(out.parts) > 1
+    assert "".join(out.parts).replace("。", "") == "第一句第二句！第三句？第四句第五句！"
 
 
 def test_skip_post_process_bypasses_everything():
@@ -154,9 +163,9 @@ def test_enable_splitter_false_skips_split_but_runs_sanitize():
 
 def test_enable_splitter_true_runs_split():
     pipe = OutputPipeline()
-    out = _out("第一句。第二句！第三句？", enable_splitter=True)
+    out = _out("第一句。第二句！第三句？第四句。第五句！", enable_splitter=True, idem_key="k")
     pipe.run(out)
-    assert out.parts == ["第一句。", "第二句！", "第三句？"]
+    assert out.parts is not None and len(out.parts) > 1
 
 
 def test_run_returns_same_mutable_outgoing():

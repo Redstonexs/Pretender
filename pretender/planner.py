@@ -104,6 +104,9 @@ class PlanResult:
     intent: PlanIntent
     reply_reference: str | None = None
     reply_to: str | None = None
+    #: MaiBot's ``reply`` tool ``reply_style``: how long this reply should be
+    #: (``简短表达`` / ``正常回复`` / ``长回复``). "" means no preference.
+    length_style: str = ""
     wait_seconds: float | None = None
     tool_results: tuple[ToolResult, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
@@ -123,6 +126,8 @@ class PlanResult:
             raise ValueError("reply_reference must be a string or None")
         if self.reply_to is not None and not isinstance(self.reply_to, str):
             raise ValueError("reply_to must be a string or None")
+        if not isinstance(self.length_style, str):
+            raise ValueError("length_style must be a string")
         if self.wait_seconds is not None and (
             isinstance(self.wait_seconds, bool)
             or not isinstance(self.wait_seconds, (int, float))
@@ -198,6 +203,8 @@ class Planner:
         chat_log: str,
         reply_style: str,
         focus_chat: str | None = None,
+        bot_name: str = "",
+        drift_block: str = "",
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -211,6 +218,11 @@ class Planner:
         ``build_context`` and appended after the rendered system prompt.
         ``chat_log`` is the plain-text chat rendering embedded in the
         system prompt. ``focus_chat`` selects the ``planner_focus`` prompt.
+        ``bot_name`` is the configured bot name (the prompts address it by
+        name rather than hardcoding one), and ``drift_block`` the rendered
+        attention-drift rules — drift governs WHICH pending message gets
+        latched onto, which is a planner decision, so it belongs in both
+        prompts rather than the replyer alone.
         """
         if not isinstance(identity, str) or not isinstance(reply_style, str):
             raise ValueError("identity and reply_style must be strings")
@@ -225,6 +237,8 @@ class Planner:
             "identity": identity,
             "chat_log": chat_log,
             "reply_style": reply_style,
+            "bot_name": bot_name,
+            "drift_block": drift_block,
         }
         if focus_chat is not None:
             variables["focus_chat"] = focus_chat
@@ -249,6 +263,7 @@ class Planner:
         rounds: list[PlanRound] = []
         reply_reference: str | None = None
         reply_to: str | None = None
+        length_style: str = ""
         wait_seconds: float | None = None
         end_reason: str | None = None
         degraded = False
@@ -323,6 +338,7 @@ class Planner:
                 intent = PlanIntent.REPLY
                 reply_reference = ctx.reply_text
                 reply_to = ctx.reply_to
+                length_style = getattr(ctx, "reply_length_style", "") or ""
                 end_reason = "reply"
                 break
             if ctx.wait_seconds is not None:
@@ -349,6 +365,7 @@ class Planner:
             intent=intent,
             reply_reference=reply_reference,
             reply_to=reply_to,
+            length_style=length_style,
             wait_seconds=wait_seconds,
             tool_results=tuple(all_results),
             usage=usage,

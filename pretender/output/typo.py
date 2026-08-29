@@ -17,6 +17,7 @@ from typing import Iterable
 import jieba
 from pypinyin import Style, pinyin
 
+from pretender.output.kaomoji import detect_kaomoji_spans
 from pretender.output.pipeline import _in_span, detect_protected_spans
 from pretender.types import Outgoing
 
@@ -61,9 +62,19 @@ def load_frequency(path: str | None = None) -> dict[str, int]:
 
 
 @lru_cache(maxsize=8)
-def _pinyin_candidates(path: str | None = None) -> dict[str, tuple[str, ...]]:
+def _pinyin_candidates(
+    path: str | None = None, min_freq: int = 0
+) -> dict[str, tuple[str, ...]]:
+    """Same-pinyin substitution candidates, most frequent first.
+
+    ``min_freq`` is MaiBot's ``chinese_typo.min_freq``: a substitution is only
+    plausible if the wrong character is one a person would actually reach for,
+    so rare characters are excluded as candidates entirely.
+    """
     groups: dict[str, list[tuple[str, int]]] = {}
     for char, frequency in load_frequency(path).items():
+        if frequency < min_freq:
+            continue
         value = pinyin(char, style=Style.NORMAL, heteronym=False)
         if not value or not value[0]:
             continue
@@ -91,17 +102,49 @@ def typo_text(
     asset_path: str | None = None,
     protected_spans: Iterable[tuple[int, int]] = (),
     max_mutations: int = 2,
+    min_freq: int = 0,
 ) -> str:
-    """Return a conservatively typo-mutated string.
+    """Return a conservatively typo-mutated string."""
+    return typo_text_with_correction(
+        text,
+        rate=rate,
+        rng=rng,
+        asset_path=asset_path,
+        protected_spans=protected_spans,
+        max_mutations=max_mutations,
+        min_freq=min_freq,
+    )[0]
 
-    URLs/code/quotes/mentions are protected by character offsets. Jieba is
-    used to walk natural-language token boundaries; only Han characters with a
-    same-pinyin candidate are eligible. Adjacent substitutions are forbidden.
+
+def typo_text_with_correction(
+    text: str,
+    *,
+    rate: float,
+    rng: random.Random,
+    asset_path: str | None = None,
+    protected_spans: Iterable[tuple[int, int]] = (),
+    max_mutations: int = 2,
+    min_freq: int = 0,
+) -> tuple[str, str]:
+    """Return ``(typo_mutated_text, correction)``.
+
+    URLs/code/quotes/mentions/kaomoji are protected by character offsets.
+    Jieba is used to walk natural-language token boundaries; only Han
+    characters with a same-pinyin candidate are eligible. Adjacent
+    substitutions are forbidden.
+
+    ``correction`` is one of the CORRECT characters that was replaced, chosen
+    at random, or ``""`` when nothing was mutated. MaiBot
+    (``typo_generator.create_typo_sentence``) returns the same thing and uses
+    it to send a follow-up message containing just the right word — which is
+    exactly what a person does after noticing their own typo.
     """
     if rate <= 0 or not text or max_mutations <= 0:
-        return text
+        return text, ""
     spans = list(protected_spans) or detect_protected_spans(text)
-    candidates = _pinyin_candidates(asset_path)
+    spans = spans + detect_kaomoji_spans(text)
+    candidates = _pinyin_candidates(asset_path, min_freq)
+    replaced: list[str] = []
     result = list(text)
     offset = 0
     mutations = 0
@@ -125,9 +168,11 @@ def typo_text(
             if not choices:
                 continue
             result[pos] = choices[rng.randrange(len(choices))]
+            replaced.append(char)
             mutations += 1
             previous_mutation = pos
-    return "".join(result)
+    correction = replaced[rng.randrange(len(replaced))] if replaced else ""
+    return "".join(result), correction
 
 
 class TypoStage:
@@ -143,11 +188,17 @@ class TypoStage:
         asset_path: str | None = None,
         rng: random.Random | None = None,
         max_mutations: int = 2,
+        correction_probability: float = 0.5,
+        min_freq: int = 0,
     ) -> None:
         self.typo_rate = max(0.0, min(1.0, typo_rate))
         self.asset_path = asset_path
         self._rng = rng
         self.max_mutations = max_mutations
+        #: MaiBot's 50/50: show the typo and correct it, or send it clean.
+        self.correction_probability = max(0.0, min(1.0, correction_probability))
+        #: Frequency floor for substitution candidates (MaiBot's min_freq).
+        self.min_freq = max(0, min_freq)
 
     def apply(self, out: Outgoing) -> Outgoing:
         if out.skip_post_process or out.enable_chinese_typo is False:
@@ -155,25 +206,54 @@ class TypoStage:
         if out.enable_chinese_typo is None and self.typo_rate <= 0:
             return out
         rng = self._rng or random.Random(_seed(out))
-        spans = detect_protected_spans(out.text)
         if out.parts:
-            out.parts = [
-                typo_text(
-                    part,
-                    rate=self.typo_rate,
-                    rng=rng,
-                    asset_path=self.asset_path,
-                    protected_spans=detect_protected_spans(part),
-                    max_mutations=self.max_mutations,
-                )
-                for part in out.parts
-            ]
-        out.text = typo_text(
-            out.text,
+            out.parts = self._typo_parts(out.parts, rng)
+            return out
+        text, correction = self._typo_one(out.text, rng)
+        out.text = text
+        if correction:
+            out.parts = [text, correction]
+        return out
+
+    def _typo_parts(self, parts: list[str], rng: random.Random) -> list[str]:
+        """Apply typos part by part, emitting at most one correction bubble.
+
+        MaiBot's rule (``process_llm_response_segments``): when a typo fires,
+        half the time it sends the typo'd text FOLLOWED BY the correct word as
+        its own message, and half the time it quietly sends the clean sentence
+        instead. The correction bubble is what makes a typo read as a person
+        catching themselves rather than as a broken encoder.
+
+        Only one correction is emitted per reply, so the part count can exceed
+        ``max_split`` by at most one.
+        """
+        result: list[str] = []
+        correction_used = False
+        for part in parts:
+            typoed, correction = self._typo_one(part, rng)
+            if correction and not correction_used:
+                correction_used = True
+                result.append(typoed)
+                result.append(correction)
+            else:
+                # No typo fired, or one already produced a correction this
+                # reply: send the clean text rather than an unexplained typo.
+                result.append(part if correction else typoed)
+        return result
+
+    def _typo_one(self, text: str, rng: random.Random) -> tuple[str, str]:
+        """Return ``(text_to_send, correction_or_empty)`` for one part."""
+        typoed, correction = typo_text_with_correction(
+            text,
             rate=self.typo_rate,
             rng=rng,
             asset_path=self.asset_path,
-            protected_spans=spans,
+            protected_spans=detect_protected_spans(text),
             max_mutations=self.max_mutations,
+            min_freq=self.min_freq,
         )
-        return out
+        if not correction:
+            return typoed, ""
+        if rng.random() < self.correction_probability:
+            return typoed, correction
+        return text, ""

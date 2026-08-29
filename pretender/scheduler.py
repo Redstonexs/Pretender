@@ -55,7 +55,7 @@ from collections import deque
 import heapq
 import logging
 import uuid
-from typing import Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from pretender.seams import Clock, Repository
 from pretender.types import (
@@ -265,6 +265,15 @@ class Scheduler:
 DispatchFn = Callable[[DispatchGrant], Awaitable[Decision]]
 
 
+#: Consecutive IDENTICAL timed re-arms tolerated before a chat is forced to
+#: event-only. A gate whose delay arithmetic does not converge re-arms the
+#: same wake forever with no new input — observed in production as 3,660
+#: dispatches over 12.8 h at a fixed 11.4375 s. The gate's own guards are the
+#: real fix; this is the containment boundary that bounds the blast radius of
+#: any future divergence.
+MAX_IDENTICAL_REARMS = 3
+
+
 class LedgerScheduler:
     """The durable dispatch-ledger scheduler (frozen Oracle advisory).
 
@@ -341,6 +350,10 @@ class LedgerScheduler:
         # chat_key -> resume_at: the durable agent barrier is active; no
         # wake (priority included) may invoke the agent before resume_at.
         self._deferred_until: dict[ChatKey, float] = {}
+        # chat_key -> (signature, consecutive count) for the identical-re-arm
+        # loop breaker. Any real progress (new commits, a re-evaluate, a
+        # different decision, an event-only release) clears the entry.
+        self._rearm_streak: dict[ChatKey, tuple[tuple[Any, ...], int]] = {}
         self._stopped = False
         self._changed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -635,20 +648,57 @@ class LedgerScheduler:
         if chat_key in self._re_evaluate:
             cause = self._re_evaluate.pop(chat_key)
             self._after_lease.pop(chat_key, None)
+            self._rearm_streak.pop(chat_key, None)
             self._push(chat_key, self._clock.now(), cause)
             return
         after = self._after_lease.pop(chat_key, {})
         if any(after.values()):
+            self._rearm_streak.pop(chat_key, None)
             self._push(chat_key, self._clock.now(), DispatchCause.INBOUND)
             return
         if decision is not None and decision.delay_seconds is not None:
-            if decision.delay_seconds > 0:
+            if decision.delay_seconds > 0 and self._may_rearm_timer(chat_key, decision):
                 deadline = self._clock.now() + decision.delay_seconds
                 self._push(chat_key, deadline, DispatchCause.TIMER)
                 return
             # Non-positive delay: defensive event-only (a 0 delay would
             # busy-loop the scheduler).
         if after:
+            self._rearm_streak.pop(chat_key, None)
             self._push(chat_key, self._clock.now(), DispatchCause.INBOUND)
             return
         # Event-only: no timed wake; the chat stays wakeable by events.
+        self._rearm_streak.pop(chat_key, None)
+
+    def _may_rearm_timer(self, chat_key: ChatKey, decision: Decision) -> bool:
+        """Whether this chat may schedule ANOTHER timed wake.
+
+        A decision that repeats byte-for-byte with no new input means the
+        evaluation is not converging: the next wake will compute the same
+        answer, and the one after that. Allow ``MAX_IDENTICAL_REARMS`` of them
+        and then fall through to event-only, so the chat still wakes on the
+        next real message but stops spinning in between. Returns False only
+        when the cap is exhausted.
+        """
+        signature = (
+            decision.action,
+            decision.reason,
+            decision.pending,
+            decision.score,
+            round(float(decision.delay_seconds or 0.0), 6),
+        )
+        previous, count = self._rearm_streak.get(chat_key, (None, 0))
+        count = count + 1 if previous == signature else 1
+        if count > MAX_IDENTICAL_REARMS:
+            self._rearm_streak.pop(chat_key, None)
+            log.warning(
+                "scheduler: %s produced %d identical re-arms (%s, delay=%.3fs) "
+                "with no new input; dropping to event-only",
+                chat_key,
+                MAX_IDENTICAL_REARMS,
+                decision.reason,
+                float(decision.delay_seconds or 0.0),
+            )
+            return False
+        self._rearm_streak[chat_key] = (signature, count)
+        return True

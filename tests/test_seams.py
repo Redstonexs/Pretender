@@ -569,7 +569,7 @@ def test_gate_context_exposes_all_frozen_evaluation_facts():
     # Every fact a GateFeature may read is a documented protocol attribute —
     # no feature needs undocumented concrete state or direct DB access.
     attrs = _protocol_members(GateContext)
-    assert len(attrs) == 32
+    assert len(attrs) == 33
     for name in (
         "chat_key", "cycle_id", "start_msg_id", "through_msg_id",
         "evaluated_ts", "self_id", "self_name",

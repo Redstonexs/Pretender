@@ -3,7 +3,11 @@
 # Secrets are ${ENV} references only, never literal values.
 
 [bot]
+# The name the prompts call the bot AND what the gate matches for a name
+# mention — one value, so the two can never disagree.
 name = "麦麦"
+# Other names this group calls it; these also count as a name mention.
+alias_names = []
 identity_file = "prompts/identity.txt"
 prompt_dir = "prompts"
 
@@ -44,15 +48,38 @@ base_s = 15
 cap_s = 300
 start_count = 2
 
+# Attention drift: how far the bot's attention wanders from the current
+# topic before coming back. Rendered into BOTH the planner and replyer
+# prompts — drift governs which pending message gets latched onto, which is
+# a planner decision.
+#   level    - subtle | active | scattered | wild
+#   anchor   - strict | balanced | loose
+#   reaction - reserved | natural | lively
 [drift]
 level = "active"
 anchor = "balanced"
 reaction = "natural"
 
+# Human output post-processing. Defaults are MaiBot's.
+#   pipeline   - stage order, honoured EXACTLY as written. sanitize first so
+#                split and typo see cleaned text; the core sanitizer always
+#                runs again last as the safety boundary.
+#   max_split  - most messages one reply may become (MaiBot max_split_num).
+#   max_length - a Chinese reply past 2x this is replaced by a short
+#                noncommittal one; a wall of text is a failed generation.
+#   typo_rate  - MaiBot's chinese_typo.error_rate.
+#   typo_min_freq - frequency floor for substitution candidates, so a typo is
+#                one a person would plausibly make.
+#   typo_correction_probability - after a typo fires, the chance of sending
+#                the correct word as a follow-up message instead of quietly
+#                sending the clean text.
 [output]
 pipeline = ["sanitize", "split", "typo"]
 max_split = 3
-typo_rate = 0.03
+max_length = 512
+typo_rate = 0.01
+typo_min_freq = 9
+typo_correction_probability = 0.5
 
 [adapter]
 name = "onebot"
@@ -60,8 +87,13 @@ name = "onebot"
 [adapter.onebot]
 mode = "reverse_ws"
 host = "127.0.0.1"
-port = 3001
+port = 3002
 path = "/onebot/v11/ws"
+# Canonical local endpoint: ws://127.0.0.1:3002/onebot/v11/ws?message_format=array
+# Keep this port at 3002 unless you change it in both Pretender and NapCat.
+# Pretender and a Dockerized NapCat must both use native Linux host networking.
+# A bridge-networked NapCat cannot reach this loopback listener; do not add
+# ports: as a workaround.
 # Configure NapCat/OneBot to dial this endpoint with
 # ?message_format=array. CQ-string payloads are rejected so @/reply metadata
 # cannot silently disappear before the gate evaluates them.

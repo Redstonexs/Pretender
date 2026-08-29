@@ -103,9 +103,30 @@ def _is_loopback_host(host: str) -> bool:
 
 @dataclass(frozen=True)
 class BotConfig:
+    """Who the bot is.
+
+    ``name`` is both what the prompts call it and what the gate matches for a
+    name mention — the two must never disagree, which is why the prompts take
+    it as a variable instead of hardcoding one.
+
+    ``alias_names`` are MaiBot's ``bot.alias_names``: other things people call
+    it in this group, which also score as a name mention. Empty by default.
+    """
+
     name: str = "麦麦"
+    alias_names: tuple[str, ...] = ()
     identity_file: str = "prompts/identity.txt"
     prompt_dir: str = "prompts"  # user prompt dir; overlays package defaults
+
+    def __post_init__(self) -> None:
+        # ``name`` is deliberately NOT required to be non-empty: it may be a
+        # non-secret ${ENV} reference that expands to nothing, and an unnamed
+        # bot simply never scores a name mention.
+        for alias in self.alias_names:
+            if not isinstance(alias, str) or not alias.strip():
+                raise ConfigError(
+                    f"bot.alias_names entries must be non-empty strings, got {alias!r}"
+                )
 
 
 @dataclass(frozen=True)
@@ -214,9 +235,40 @@ class DriftConfig:
 
 @dataclass(frozen=True)
 class OutputConfig:
+    """Human output post-processing. Defaults are MaiBot's.
+
+    ``max_split`` is MaiBot's ``response_splitter.max_split_num``;
+    ``max_length`` its ``response_splitter.max_length`` (a Chinese reply past
+    ``2 x max_length`` is replaced by a short noncommittal one, on the theory
+    that a wall of text is a failed generation, not a message);
+    ``typo_rate`` its ``chinese_typo.error_rate``; ``typo_min_freq`` its
+    ``chinese_typo.min_freq``, the floor that keeps a substitution from
+    picking an obscure character nobody would actually mistype;
+    ``typo_correction_probability`` its ``chinese_typo`` 50/50 between
+    "show the typo then send the correct word" and "quietly send it clean".
+
+    MaiBot additionally has ``tone_error_rate`` and ``word_replace_rate`` for
+    tone-only and whole-word homophone errors. Pretender's typo lane is
+    same-pinyin character substitution only; those two knobs are deliberately
+    absent rather than accepted and ignored.
+    """
+
     pipeline: tuple[str, ...] = ("sanitize", "split", "typo")
     max_split: int = 3
-    typo_rate: float = 0.03
+    max_length: int = 512
+    typo_rate: float = 0.01
+    typo_min_freq: int = 9
+    typo_correction_probability: float = 0.5
+
+    def __post_init__(self) -> None:
+        _check_positive_int("output.max_split", self.max_split)
+        _check_nonneg_int("output.max_length", self.max_length)
+        _check_nonneg_int("output.typo_min_freq", self.typo_min_freq)
+        for name in ("typo_rate", "typo_correction_probability"):
+            value = getattr(self, name)
+            _check_finite_nonneg(f"output.{name}", value)
+            if value > 1:
+                raise ConfigError(f"output.{name} must be between 0 and 1, got {value!r}")
 
 
 @dataclass(frozen=True)

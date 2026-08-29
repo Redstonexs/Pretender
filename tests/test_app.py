@@ -2100,7 +2100,8 @@ class _FakePlanner:
         self.calls = 0
 
     async def plan(self, messages, *, identity, chat_log, reply_style,
-                   focus_chat=None, tools=None, temperature=None,
+                   focus_chat=None, bot_name="", drift_block="",
+                   tools=None, temperature=None,
                    max_tokens=None, deadline=None, max_tool_rounds=None):
         self.calls += 1
         from pretender.planner import PlanIntent, PlanResult
@@ -2116,8 +2117,8 @@ class _FakeReplyer:
         self.calls = 0
 
     async def reply(self, *, reply_reference, identity, reply_style,
-                    reply_to=None, temperature=None, max_tokens=None,
-                    deadline=None):
+                    reply_to=None, context=None, temperature=None,
+                    max_tokens=None, deadline=None):
         self.calls += 1
         from pretender.replyer import ReplyDraft
 

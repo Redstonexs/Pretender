@@ -340,6 +340,8 @@ class GateSnapshot:
     last_message: Message | None
     # signal-derived and durable-state facts (fail-closed defaults)
     self_name: str | None = None
+    #: Other names this bot answers to (MaiBot's ``bot.alias_names``).
+    self_aliases: tuple[str, ...] = ()
     has_direct_at: bool = False
     has_quote_to_self: bool = False
     has_other_assistant: bool = False

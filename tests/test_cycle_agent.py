@@ -109,6 +109,8 @@ class FakePlanner:
         chat_log,
         reply_style,
         focus_chat=None,
+        bot_name="",
+        drift_block="",
         tools=None,
         temperature=None,
         max_tokens=None,
@@ -143,6 +145,7 @@ class FakeReplyer:
         identity,
         reply_style,
         reply_to=None,
+        context=None,
         temperature=None,
         max_tokens=None,
         deadline=None,
@@ -395,7 +398,7 @@ def test_agent_reply_creates_single_ledger_outbox_batch(tmp_path):
     # The planner saw the pending transcript and the rendered chat log.
     # The identity is the configured identity_file content (not merely the
     # bot name).
-    assert "你是麦麦，一个群聊里的普通成员" in planner.calls[0]["identity"]
+    assert "群聊里的普通成员" in planner.calls[0]["identity"]
     assert "user: hi" in planner.calls[0]["chat_log"]
     assert [m.role for m in planner.calls[0]["messages"]] == ["user"]
 
@@ -759,13 +762,16 @@ def test_agent_legal_tool_results_and_analysis_absent(tmp_path):
     answer_ids = [m.tool_call_id for m in second_msgs if m.role == "tool"]
     assert tool_ids == [ToolCallId("call_1")]
     assert answer_ids == [ToolCallId("call_1")]
-    # The replyer's transcript carries only the staged reference — never the
-    # planner's analysis or tool JSON.
+    # The replyer's transcript carries the chat and the staged reference —
+    # never the planner's analysis or tool JSON.
     replyer_msgs = replyer_llm.calls[0][0]
-    assert [m.role for m in replyer_msgs] == ["system", "user"]
-    assert "分析" not in replyer_msgs[1].content
-    assert "call_1" not in replyer_msgs[1].content
-    assert "call_2" not in replyer_msgs[1].content
+    assert replyer_msgs[0].role == "system"
+    assert all(m.role in ("system", "user", "assistant") for m in replyer_msgs)
+    assert not any(m.role == "tool" for m in replyer_msgs)
+    body = "\n".join(m.content or "" for m in replyer_msgs[1:])
+    assert "分析：用户打招呼，值得回复。" not in body
+    assert "call_1" not in body
+    assert "call_2" not in body
 
 
 # ── hook and marker trace ordering ───────────────────────────────────────────
@@ -1679,10 +1685,15 @@ def test_identity_file_reaches_planner_and_replyer_prompts(tmp_path):
     assert decision.action == "trigger"
     # The identity_file content appears in the planner's system prompt.
     planner_sys = planner_llm.calls[0][0][0].content
-    assert "你是麦麦，一个群聊里的普通成员" in planner_sys
+    # The identity file supplies the persona; the configured bot.name
+    # supplies the name, so a rename never leaves the prompts disagreeing
+    # with the gate about what the bot is called.
+    assert "群聊里的普通成员" in planner_sys
+    assert "你是麦麦的决策者" in planner_sys
     # And in the replyer's system prompt.
     replyer_sys = replyer_llm.calls[0][0][0].content
-    assert "你是麦麦，一个群聊里的普通成员" in replyer_sys
+    assert "群聊里的普通成员" in replyer_sys
+    assert "你的名字是麦麦" in replyer_sys
     # Planner analysis never reaches the replyer's user turn.
     replyer_user = replyer_llm.calls[0][0][1].content
     assert "分析" not in replyer_user
@@ -2167,8 +2178,8 @@ def test_agent_adaptive_reply_style_and_context_frozen_for_planner_and_replyer(t
     decision, planner, replyer, exposures, dispatch_id, through_msg_id = run(scenario())
     assert decision.action == "trigger"
     # The SAME adaptive reply style reached the planner and the replyer.
-    assert planner.calls[0]["reply_style"] == "活泼"
-    assert replyer.calls[0]["reply_style"] == "活泼"
+    assert planner.calls[0]["reply_style"] == "当greeting时，活泼"
+    assert replyer.calls[0]["reply_style"] == "当greeting时，活泼"
     # The adaptive reference block rode in the planner's chat log.
     assert "【自适应参考】" in planner.calls[0]["chat_log"]
     assert "活泼" in planner.calls[0]["chat_log"]
@@ -2247,7 +2258,7 @@ def test_agent_adaptive_context_not_queried_before_gate_trigger(tmp_path):
     # The planner ran (the gate triggered the agent lane), but the adaptive
     # context is only computed for the agent saga — a wait still gets it.
     # The KEY assertion: no exposure fires for a non-reply outcome.
-    assert planner.calls[0]["reply_style"] == "活泼"
+    assert planner.calls[0]["reply_style"] == "当greeting时，活泼"
 
 
 def test_agent_settled_callback_only_after_terminal(tmp_path):
@@ -2556,7 +2567,12 @@ def test_agent_media_unknown_asset_degrades_to_no_action(tmp_path):
     decision, outbox, cycles = run(scenario())
     assert decision.action == "trigger"
     assert outbox == 0
-    assert cycles == [("no_action",)]
+    # The ledger records the SPECIFIC degraded exit, not a flattened
+    # "no_action": the second planner round returned no content at all, so the
+    # loop ended on ``empty_response``. Keeping the distinction is what lets an
+    # operator tell a model that cannot drive the tool loop apart from one that
+    # deliberately chose to stay quiet.
+    assert cycles == [("empty_response",)]
 
 
 def test_agent_catalog_prompt_is_cooldown_aware(tmp_path):

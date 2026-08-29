@@ -126,13 +126,21 @@ class RelevanceFeature:
 
 
 def _name_mentioned(ctx: GateSnapshot) -> bool:
-    """True when the bot's structured ``self_name`` appears in a normalized
-    pending text (case-insensitive). No name → no mention."""
-    name = ctx.self_name
-    if not name:
+    """True when the bot's name, or any configured alias, appears in a
+    normalized pending text (case-insensitive). No name → no mention.
+
+    Aliases are MaiBot's ``bot.alias_names``: a group that has settled on a
+    nickname must not be met with silence merely because the config says
+    something else.
+    """
+    names = [n for n in (ctx.self_name, *ctx.self_aliases) if n]
+    if not names:
         return False
-    folded = name.casefold()
-    return any(folded in normalize_text(m.text).casefold() for m in ctx.pending_messages)
+    folded = [n.casefold() for n in names]
+    return any(
+        any(name in normalize_text(m.text).casefold() for name in folded)
+        for m in ctx.pending_messages
+    )
 
 
 class ContentFeature:
@@ -194,7 +202,15 @@ class PressureFeature:
             if (
                 ctx.pending > 0
                 and _positive_avg(ctx.recent_average_interval)
-                and ctx.idle_seconds >= ctx.recent_average_interval
+                and (
+                    ctx.idle_seconds >= ctx.recent_average_interval
+                    # A clamped idle means the whole presence window held no
+                    # non-self message, so the real idle is at least the
+                    # window and the chat HAS gone quiet. Comparing the floor
+                    # against a larger average would withhold the bonus from
+                    # exactly the lull it exists to detect.
+                    or _idle_is_clamped(ctx)
+                )
             )
             else 0.0
         )
@@ -297,6 +313,18 @@ def compose(contributions: Sequence[Contribution]) -> tuple[float, float, float,
 
 
 # ── The gate evaluator ──────────────────────────────────────────────────────
+
+def _idle_is_clamped(snapshot: GateSnapshot) -> bool:
+    """Whether ``idle_seconds`` is the window floor rather than a measurement.
+
+    ``assemble_snapshot`` pins ``idle_seconds`` to the presence-window length
+    when the window holds no non-self message (``last_nonself_ts is None``) —
+    a conservative LOWER BOUND, not the real idle time, which may be hours.
+    Arithmetic that treats the floor as the true value produces a constant
+    that never converges, so every such consumer must branch on this first.
+    """
+    return snapshot.last_nonself_ts is None
+
 
 def _positive_avg(avg: float | None) -> bool:
     """True when the recent average interval is available and positive."""
@@ -566,8 +594,18 @@ def _virtual_messages(snapshot: GateSnapshot) -> tuple[float, float]:
 
 def _reply_delay_seconds(snapshot: GateSnapshot) -> float | None:
     """reply_necessity delay: timed ONLY until the idle bonus activates
-    (``avg − idle`` when pending > 0, avg > 0, idle < avg); otherwise
-    event-only."""
+    (``avg - idle`` when pending > 0, avg > 0, idle < avg); otherwise
+    event-only.
+
+    A CLAMPED idle is event-only. With ``last_nonself_ts is None`` the idle is
+    the window floor, so for any ``avg > window`` the difference is a positive
+    constant the next evaluation reproduces exactly — the chat re-arms the
+    same wake forever (observed: 3,660 dispatches in 12.8 h at a fixed
+    11.4375 s). The bonus is already active in that state anyway; there is
+    nothing left to wait for.
+    """
+    if _idle_is_clamped(snapshot):
+        return None
     avg = snapshot.recent_average_interval
     if (
         snapshot.pending > 0
@@ -582,7 +620,11 @@ def _frequency_delay_seconds(snapshot: GateSnapshot) -> float | None:
     """frequency delay: timed until the trigger becomes reachable
     (``avg·(threshold − pending) − idle`` when pending > 0, avg > 0, and
     pending < threshold); otherwise event-only. With zero pending the
-    virtual cap makes the trigger unreachable, so the delay is event-only."""
+    virtual cap makes the trigger unreachable, so the delay is event-only.
+    A clamped idle is event-only for the same reason as
+    ``_reply_delay_seconds``."""
+    if _idle_is_clamped(snapshot):
+        return None
     avg = snapshot.recent_average_interval
     if (
         snapshot.pending > 0

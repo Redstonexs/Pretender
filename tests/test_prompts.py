@@ -20,7 +20,7 @@ def _write(path, content: str) -> None:
 def test_package_default_identity_exists():
     store = PromptStore()
     text = store.load("identity.txt")
-    assert "麦麦" in text
+    assert "群聊里的普通成员" in text
 
 
 # ── load_identity (bot.identity_file) ────────────────────────────────────────
@@ -30,7 +30,7 @@ def test_load_identity_default_path_resolves_package():
     through the prompt infrastructure to the shipped package identity."""
     store = PromptStore()
     text = store.load_identity("prompts/identity.txt")
-    assert "麦麦" in text
+    assert "群聊里的普通成员" in text
 
 
 def test_load_identity_user_dir_shadows_package(tmp_path):
@@ -80,7 +80,7 @@ def test_user_file_only(tmp_path):
 
 def test_user_file_appearing_later_shadows_package(tmp_path):
     store = PromptStore(user_dir=tmp_path)
-    assert "麦麦" in store.load("identity.txt")  # package default first
+    assert "群聊里的普通成员" in store.load("identity.txt")  # package default first
     _write(tmp_path / "identity.txt", "后来出现的用户文件")
     assert store.load("identity.txt") == "后来出现的用户文件"
 
@@ -177,9 +177,18 @@ PHASE3_ASSETS = ("planner.txt", "planner_focus.txt", "replyer.txt")
 
 # The {{var}} set each Phase 3 asset declares (must match the file exactly).
 PHASE3_VARS = {
-    "planner.txt": ("identity", "chat_log", "reply_style"),
-    "planner_focus.txt": ("identity", "chat_log", "reply_style", "focus_chat"),
-    "replyer.txt": ("identity", "reply_style", "reply_reference"),
+    "planner.txt": ("identity", "chat_log", "reply_style", "bot_name", "drift_block"),
+    "planner_focus.txt": (
+        "identity",
+        "chat_log",
+        "reply_style",
+        "focus_chat",
+        "bot_name",
+        "drift_block",
+    ),
+    # The reply reference is no longer a system-prompt slot: it rides in the
+    # final user turn, next to the time and the target message.
+    "replyer.txt": ("identity", "reply_style", "bot_name", "drift_block"),
 }
 
 

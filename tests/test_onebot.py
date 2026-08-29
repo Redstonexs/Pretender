@@ -6,6 +6,8 @@ heartbeat/close, delivery-key resolution, and Adapter Protocol compatibility."""
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,6 +16,7 @@ import pytest
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.server import serve as ws_serve
 from websockets.exceptions import ConnectionClosed
+from websockets.frames import CloseCode
 from websockets.protocol import State
 
 from pretender.adapters.onebot import OneBotAdapter
@@ -34,6 +37,21 @@ def make_adapter(**kw) -> OneBotAdapter:
     kw.setdefault("clock", VirtualClock())
     kw.setdefault("normalize_media", False)
     return OneBotAdapter(config=cfg, **kw)
+
+
+@contextmanager
+def capture_onebot_logs(caplog):
+    """Capture the adapter logger even after setup_logging disables parent
+    propagation (as test_log.py does for the full-suite process)."""
+    logger = logging.getLogger("pretender.onebot")
+    previous_propagate = logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.propagate = False
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.propagate = previous_propagate
 
 
 def adapter_port(adapter: OneBotAdapter) -> int:
@@ -1554,6 +1572,146 @@ def test_ready_requires_login_identity_and_probe():
     assert run(scenario()) is True
 
 
+def test_readiness_observability_logs_secret_free_generation_and_success(caplog):
+    async def scenario():
+        cfg = OneBotConfig(
+            host="127.0.0.1",
+            port=0,
+            access_token="super-secret-token",
+            heartbeat_timeout_s=None,
+        )
+        adapter = make_adapter(config=cfg)
+        await adapter.connect()
+        port = adapter_port(adapter)
+        client = await FakeOneBot(port, token="super-secret-token").connect()
+        raw = await asyncio.wait_for(client.ws.recv(), 2.0)
+        probe = orjson.loads(raw)
+        await client.respond(probe["echo"], retcode=0, data={"user_id": 10001})
+        await asyncio.sleep(0.05)
+        assert adapter.ready is True
+        await client.close()
+        await adapter.close()
+
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        run(scenario())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("connection generation adopted/reset" in message for message in messages)
+    assert sum("readiness established" in message for message in messages) == 1
+    assert any("generation=1" in message for message in messages)
+    assert "super-secret-token" not in caplog.text
+    assert "ws://127.0.0.1" not in caplog.text
+    assert "10001" not in caplog.text
+
+
+def test_readiness_observability_logs_probe_timeout_and_not_ready(caplog):
+    async def scenario():
+        cfg = OneBotConfig(
+            host="127.0.0.1",
+            port=0,
+            action_timeout_s=0.01,
+            heartbeat_timeout_s=None,
+        )
+        adapter = make_adapter(config=cfg)
+        await adapter.connect()
+        port = adapter_port(adapter)
+        client = await FakeOneBot(port).connect()
+        # Leave get_login_info unanswered so the readiness task times out.
+        await asyncio.sleep(0.05)
+        assert adapter.ready is False
+        await wait_disconnected(adapter)
+        assert client.ws.close_code == CloseCode.TRY_AGAIN_LATER
+        await client.close()
+        await adapter.close()
+
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        run(scenario())
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "readiness probe timed out" in message
+        and "generation=1" in message
+        and "not-ready" in message
+        and "waits for reconnect" in message
+        for message in messages
+    )
+    assert "get_login_info" not in caplog.text
+
+
+def test_readiness_observability_logs_identity_mismatch_without_ids(caplog):
+    adapter = make_adapter(self_id="configured-secret-id")
+    adapter._connection_generation = 1
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+
+    with capture_onebot_logs(caplog):
+        adapter._learn_self_id({"self_id": "unexpected-id"}, generation=1)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        record.levelno >= logging.WARNING and "identity mismatch" in record.getMessage()
+        for record in caplog.records
+    )
+    assert "configured-secret-id" not in caplog.text
+    assert "unexpected-id" not in caplog.text
+
+
+def test_failed_probe_closes_generation_and_fresh_probe_can_ready(caplog):
+    async def scenario():
+        cfg = OneBotConfig(
+            host="127.0.0.1",
+            port=0,
+            access_token="super-secret-token",
+            heartbeat_timeout_s=None,
+        )
+        adapter = make_adapter(config=cfg)
+        await adapter.connect()
+        port = adapter_port(adapter)
+
+        first = await FakeOneBot(port, token="super-secret-token").connect()
+        raw = await asyncio.wait_for(first.ws.recv(), 2.0)
+        failed_probe = orjson.loads(raw)
+        await first.respond(
+            failed_probe["echo"],
+            retcode=1,
+            data={"user_id": "wrong-account", "payload": "do-not-log"},
+        )
+        await wait_disconnected(adapter)
+        first_close_code = first.ws.close_code
+
+        second = await FakeOneBot(port, token="super-secret-token").connect()
+        raw = await asyncio.wait_for(second.ws.recv(), 2.0)
+        fresh_probe = orjson.loads(raw)
+        await second.respond(fresh_probe["echo"], retcode=0, data={"user_id": 10001})
+        await asyncio.sleep(0.05)
+        ready = adapter.ready
+        generation = adapter.generation
+        await second.close()
+        await adapter.close()
+        return first_close_code, generation, ready
+
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        first_close_code, generation, ready = run(scenario())
+
+    assert first_close_code == CloseCode.TRY_AGAIN_LATER
+    assert generation == 2
+    assert ready is True
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "readiness probe failed" in message
+        and "generation=1" in message
+        and "not-ready" in message
+        and "waits for reconnect" in message
+        for message in messages
+    )
+    assert any("readiness established" in message and "generation=2" in message for message in messages)
+    assert "super-secret-token" not in caplog.text
+    assert "ws://127.0.0.1" not in caplog.text
+    assert "wrong-account" not in caplog.text
+    assert "do-not-log" not in caplog.text
+    assert "10001" not in caplog.text
+
+
 def test_ready_self_id_event_counts_as_lifecycle():
     """A self_id-bearing inbound event (not just a lifecycle meta-event)
     satisfies the lifecycle/self_id half of readiness."""
@@ -1770,3 +1928,64 @@ def test_busy_reverse_port_reports_the_address_and_the_fix():
             await holder.wait_closed()
 
     run(scenario())
+
+
+# ── the platform account's own login state ──────────────────────────────────
+#
+# ``status.online`` in a heartbeat is the ACCOUNT's session, not the
+# transport. They diverge in the worst way: NapCat keeps the socket open,
+# keeps heartbeating and keeps answering get_login_info — so the adapter
+# reaches ready and everything looks healthy — while the account is logged
+# out and no message can arrive. Production sat like that for 20 hours,
+# indistinguishable from a bot that simply had nothing to say.
+
+def _heartbeat(online):
+    return {
+        "post_type": "meta_event",
+        "meta_event_type": "heartbeat",
+        "self_id": 10001,
+        "status": {"online": online, "good": True},
+        "interval": 30000,
+    }
+
+
+def test_offline_heartbeat_is_reported(caplog):
+    adapter = make_adapter()
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        adapter._note_platform_online(_heartbeat(False))
+    assert any("OFFLINE" in r.getMessage() for r in caplog.records)
+    assert adapter._platform_online is False
+
+
+def test_only_transitions_are_logged(caplog):
+    """A heartbeat every 30 s must not become a log flood."""
+    adapter = make_adapter()
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        for _ in range(5):
+            adapter._note_platform_online(_heartbeat(False))
+    assert len([r for r in caplog.records if "OFFLINE" in r.getMessage()]) == 1
+
+
+def test_coming_back_online_is_reported(caplog):
+    adapter = make_adapter()
+    adapter._note_platform_online(_heartbeat(False))
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        adapter._note_platform_online(_heartbeat(True))
+    assert any("is online" in r.getMessage() for r in caplog.records)
+    assert adapter._platform_online is True
+
+
+def test_heartbeat_without_status_is_ignored(caplog):
+    adapter = make_adapter()
+    caplog.set_level(logging.INFO, logger="pretender.onebot")
+    with capture_onebot_logs(caplog):
+        adapter._note_platform_online({"post_type": "meta_event",
+                                       "meta_event_type": "heartbeat"})
+        adapter._note_platform_online({"post_type": "meta_event",
+                                       "meta_event_type": "heartbeat",
+                                       "status": "not-a-dict"})
+    assert adapter._platform_online is None
+    assert not caplog.records

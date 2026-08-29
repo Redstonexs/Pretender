@@ -102,6 +102,9 @@ def test_core_tool_schemas_are_clean():
         "properties": {
             "text": {"type": "string"},
             "reply_to": {"type": ["string", "null"]},
+            # MaiBot's length directive: the planner chooses how long the
+            # reply should be, the replyer is told.
+            "reply_style": {"type": ["string", "null"]},
         },
         "required": ["text"],
     }

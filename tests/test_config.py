@@ -80,23 +80,33 @@ def test_sample_toml_loads_with_env(monkeypatch, sample_config_path):
     assert cfg.adapter.onebot.access_token == "ob-token"
 
 
-def test_docker_example_is_minimal_live_config(monkeypatch, sample_config_path):
+def test_docker_example_is_the_shipped_live_config(monkeypatch, sample_config_path):
+    """The docker example must match what the wizard generates, and must have
+    the adaptive stack ON — a deployment without [learn] has a reply style
+    frozen at 自然 and never learns how its group talks."""
     monkeypatch.setenv("PRETENDER_LLM_API_KEY", "llm-docker-test")
     monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "ob-docker-test")
 
     cfg = load_config(sample_config_path.parent / "config.docker.example.toml")
 
+    # Neither vision nor embed: opencode.ai/zen has no /embeddings endpoint
+    # and no model that actually reads an image.
     assert set(cfg.llm.profiles) == {"planner", "reply"}
-    assert cfg.llm.profile("planner").base_url == "https://api.deepseek.com/v1"
-    assert cfg.llm.profile("planner").model == "deepseek-chat"
-    assert cfg.llm.profile("planner").api_key == "llm-docker-test"
-    assert cfg.llm.profile("reply").base_url == "https://api.deepseek.com/v1"
-    assert cfg.llm.profile("reply").model == "deepseek-chat"
-    assert cfg.llm.profile("reply").api_key == "llm-docker-test"
+    for name in ("planner", "reply"):
+        assert cfg.llm.profile(name).base_url == "https://opencode.ai/zen/v1"
+        assert cfg.llm.profile(name).model == "ling-3.0-flash-fin-free"
+        assert cfg.llm.profile(name).api_key == "llm-docker-test"
+    assert cfg.learn.enabled
+    assert set(cfg.learn.profiles) == {
+        "expression", "behavior", "jargon", "summary", "effect",
+    }
+    assert cfg.drift.level == "active"
+    assert cfg.media.enabled is False
+    assert cfg.output.typo_rate == 0.01
     assert cfg.adapter.name == "onebot"
     assert cfg.adapter.onebot.mode == "reverse_ws"
     assert cfg.adapter.onebot.host == "127.0.0.1"
-    assert cfg.adapter.onebot.port == 3001
+    assert cfg.adapter.onebot.port == 3002
     assert cfg.adapter.onebot.path == "/onebot/v11/ws"
     assert cfg.adapter.onebot.access_token == "ob-docker-test"
     assert cfg.adapter.onebot.self_id is None

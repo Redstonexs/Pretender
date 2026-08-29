@@ -62,7 +62,8 @@ class FakePlanner:
         self.calls = 0
 
     async def plan(self, messages, *, identity, chat_log, reply_style,
-                   focus_chat=None, tools=None, temperature=None,
+                   focus_chat=None, bot_name="", drift_block="",
+                   tools=None, temperature=None,
                    max_tokens=None, deadline=None, max_tool_rounds=None):
         self.calls += 1
         return self.result or PlanResult(intent=PlanIntent.NO_ACTION)
@@ -76,8 +77,8 @@ class FakeReplyer:
         self.calls = 0
 
     async def reply(self, *, reply_reference, identity, reply_style,
-                    reply_to=None, temperature=None, max_tokens=None,
-                    deadline=None):
+                    reply_to=None, context=None, temperature=None,
+                    max_tokens=None, deadline=None):
         self.calls += 1
         return self.draft or ReplyDraft.empty()
 
@@ -294,8 +295,12 @@ def test_agent_reply_passes_pipeline_before_outbox(tmp_path):
 
     decision, rows, planner, replyer = run(scenario())
     assert decision.action == "trigger"
-    # sanitize removed the CQ code; split produced two ordered parts.
-    assert [r[0] for r in rows] == ["你好世界。", "再见！"]
+    # Sanitize runs FIRST, so the CQ code is gone before split ever sees the
+    # text. How many bubbles the split produces is probabilistic (seeded from
+    # the durable output identity), so assert the content, not the count.
+    texts = [r[0] for r in rows]
+    assert "CQ:" not in "".join(texts)
+    assert "".join(texts).replace("。", "") == "你好世界再见！"
     assert planner.calls == 1 and replyer.calls == 1
 
 
@@ -308,7 +313,7 @@ def test_split_parts_share_group_order_pacing(tmp_path):
         await repo.upsert_chat(make_identity())
         await repo.ingest_message(make_identity(), _trigger_message())
         grant = await _begin_dispatch(repo)
-        agent, _, _ = _reply_agent("第一句。第二句！第三句？")
+        agent, _, _ = _reply_agent("第一句\n第二句\n第三句")
         await _runner(repo, agent).run_dispatch(grant)
         rows = await db.read(
             lambda c: c.execute(
@@ -319,7 +324,7 @@ def test_split_parts_share_group_order_pacing(tmp_path):
         return rows
 
     rows = run(scenario())
-    assert [r[0] for r in rows] == ["第一句。", "第二句！", "第三句？"]
+    assert [r[0] for r in rows] == ["第一句", "第二句", "第三句"]
     assert len({r[1] for r in rows}) == 1  # one stable group id
     assert [r[2] for r in rows] == [0, 1, 2]  # ordered by seq
     assert rows[0][3] is None  # part 0 sends immediately
@@ -364,7 +369,7 @@ def test_live_worker_sends_split_parts_with_pacing(tmp_path):
         PlanResult(intent=PlanIntent.REPLY, reply_reference="参考",
                    tokens_in=5, tokens_out=2, end_reason="reply")
     )
-    replyer = FakeReplyer(ReplyDraft(text="第一句。第二句！", tokens_in=3, tokens_out=1))
+    replyer = FakeReplyer(ReplyDraft(text="第一句\n第二句", tokens_in=3, tokens_out=1))
     cfg = Config.from_dict(
         {"storage": {"db_path": str(tmp_path / "data" / "app.db")}}
     )
@@ -396,7 +401,7 @@ def test_live_worker_sends_split_parts_with_pacing(tmp_path):
         return [o.text for o in app.adapter.sent]
 
     sent = run(scenario())
-    assert sent == ["第一句。", "第二句！"]  # both parts, exactly once
+    assert sent == ["第一句", "第二句"]  # both parts, exactly once
 
 
 # ── dry-run: pipeline evaluates, zero outbox/send ───────────────────────────
@@ -410,7 +415,7 @@ def test_dry_run_pipeline_zero_outbox_zero_send(tmp_path):
         PlanResult(intent=PlanIntent.REPLY, reply_reference="参考",
                    tokens_in=5, tokens_out=2, end_reason="reply")
     )
-    replyer = FakeReplyer(ReplyDraft(text="第一句。第二句！", tokens_in=3, tokens_out=1))
+    replyer = FakeReplyer(ReplyDraft(text="第一句\n第二句", tokens_in=3, tokens_out=1))
     cfg = Config.from_dict(
         {"storage": {"db_path": str(tmp_path / "data" / "app.db")}}
     )

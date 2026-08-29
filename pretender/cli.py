@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import logging
 import signal
 import sys
 from pathlib import Path
@@ -54,6 +55,7 @@ from pretender.cycle import replay_marker_schedule, sweep_marker_schedule
 from pretender.db import Database
 from pretender.doctor import Doctor, DoctorReport
 from pretender.errors import ConfigError, PretenderError, RepoError
+from pretender.log import JsonFormatter, setup_logging
 from pretender.record import CorpusView, read_corpus_view
 from pretender.repo import SqliteRepository
 from pretender.types import (
@@ -149,8 +151,46 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_logging(cfg: Config) -> None:
+    """Install the ``[log]`` handlers on the ``pretender`` logger.
+
+    Without this call the logger has NO handler and inherits root's WARNING
+    level, so every ``log.info`` — adapter readiness, gate decisions, outbox
+    sends — is discarded and ``docker logs`` stays empty. That is exactly how
+    a bot that silently never replies becomes undiagnosable.
+
+    Degrades rather than refusing to boot: an unusable log directory or an
+    unknown level falls back to a stderr-only JSONL stream, because losing the
+    log file is recoverable and failing to start is not.
+    """
+    try:
+        setup_logging(
+            directory=cfg.log.dir,
+            level=cfg.log.level,
+            max_bytes=cfg.log.max_bytes,
+            backup_count=cfg.log.backup_count,
+        )
+        return
+    except (OSError, ValueError) as exc:
+        reason = exc
+    logger = logging.getLogger("pretender")
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    logger.warning(
+        "log setup failed for dir=%r level=%r (%s); using stderr only",
+        cfg.log.dir,
+        cfg.log.level,
+        reason,
+    )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     cfg = Config.load(args.config)
+    _configure_logging(cfg)
     if args.live:
         # Live is EXPLICIT: it requires the planner/reply LLM profiles and
         # sends real messages through the configured adapter. Never the

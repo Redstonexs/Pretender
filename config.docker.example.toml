@@ -1,17 +1,108 @@
 # Minimal live configuration for the Docker deployment.
+# Kept in step with scripts/deploy.py::render_config — the wizard writes
+# this same shape, so what you see here is what a fresh deploy produces.
 
+# The bot's own name. It is what the gate matches on for a name
+# mention, and what the prompts call it.
 [bot]
 name = "麦麦"
 
+# When the bot speaks. A direct @ or a quote of its own message
+# ALWAYS replies and ignores everything below.
+#   trigger_score - the score needed to speak unprompted (0-100).
+#                   Lower = chattier. A name mention scores 80, a
+#                   private chat 40, an unaddressed group message
+#                   0 plus content and pressure bonuses.
+#   threshold     - how many unanswered messages count as 'a lot'.
+#                   Pressure reaches 50 at this count, so a smaller
+#                   threshold makes the bot join in sooner.
+#   frequency     - a global damper: scales every score by
+#                   0.5 + 0.5*frequency. 1.0 = no damping.
+# Defaults below answer when addressed and otherwise chime in on a
+# busy conversation. For a chattier bot try threshold = 4 with
+# trigger_score = 55; for @-only set trigger_score = 100.
+[gate]
+threshold = 8
+trigger_score = 60
+frequency = 1.0
+
+# JSONL logs, also echoed to stdout (docker logs / ./deploy.sh logs).
+# Raise to "DEBUG" when diagnosing why the bot did or did not speak.
+[log]
+dir = "logs"
+level = "INFO"
+
 [llm.profiles.planner]
-base_url = "https://api.deepseek.com/v1"
+base_url = "https://opencode.ai/zen/v1"
 api_key = "${PRETENDER_LLM_API_KEY}"
-model = "deepseek-chat"
+model = "ling-3.0-flash-fin-free"
 
 [llm.profiles.reply]
-base_url = "https://api.deepseek.com/v1"
+base_url = "https://opencode.ai/zen/v1"
 api_key = "${PRETENDER_LLM_API_KEY}"
-model = "deepseek-chat"
+model = "ling-3.0-flash-fin-free"
+
+[output]
+pipeline = ["sanitize", "split", "typo"]
+max_split = 3
+typo_rate = 0.01
+
+# No vision profile: this provider serves no model that accepts
+# image input, so incoming images cannot be described and
+# [media] stays off. 该提供商没有支持图片输入的模型。
+# [llm.profiles.vision]
+# base_url = ...
+# model = ...
+
+# No embed profile: this provider has no /embeddings endpoint,
+# so semantic memory recall and expression selection fall back
+# to full-text search and record weight. Everything still works,
+# it just matches on words rather than meaning.
+# 该提供商没有 /embeddings 接口，记忆检索退化为全文搜索。
+# [llm.profiles.embed]
+# base_url = ...
+# model = ...
+
+# Learn how this group actually talks: expression style, slang,
+# behaviour patterns, conversation summaries, and whether the
+# references shown to the planner were actually used.
+# Without this the reply style is frozen at "自然" forever.
+# 学习这个群的说话方式；关掉的话回复风格永远是"自然"。
+[learn]
+enabled = true
+cadence_s = 3600
+
+[learn.profiles.expression]
+cadence_s = 1800
+
+[learn.profiles.behavior]
+cadence_s = 3600
+
+[learn.profiles.jargon]
+cadence_s = 3600
+
+[learn.profiles.summary]
+cadence_s = 7200
+
+[learn.profiles.effect]
+cadence_s = 7200
+
+# Attention drift: how far the bot's attention wanders from the
+# current topic before coming back. Injected into both prompts.
+#   level    - subtle | active | scattered | wild
+#   anchor   - strict | balanced | loose   (how firmly it returns)
+#   reaction - reserved | natural | lively (short interjections)
+# 注意力漂移：话题跳跃的程度。
+[drift]
+level = "active"
+anchor = "balanced"
+reaction = "natural"
+
+# Emoji, stickers and image replies. Needs a vision profile to
+# describe what an incoming image actually contains.
+# 表情包与图片回复，需要 vision 配置。
+[media]
+enabled = false
 
 [adapter]
 name = "onebot"
@@ -19,9 +110,15 @@ name = "onebot"
 [adapter.onebot]
 mode = "reverse_ws"
 host = "127.0.0.1"
-# 3001 很容易被其他程序占用。改这里的端口后，NapCat 的连接地址要改成同一个端口。
-# Port 3001 collides often. Change it here and point NapCat at the same port.
-port = 3001
+# Canonical endpoint / 标准连接地址：
+# ws://127.0.0.1:3002/onebot/v11/ws?message_format=array
+# Keep this port at 3002 unless it is changed in both Pretender and NapCat.
+# 除非 Pretender 和 NapCat 两边一起修改，否则保持 3002。
+# Pretender and Dockerized NapCat both require native Linux host networking;
+# bridge mode cannot reach 127.0.0.1, and ports: is not a workaround.
+# Pretender 和 Docker 化 NapCat 都必须使用原生 Linux host 网络；bridge 网络无法
+# 访问 127.0.0.1，不能用 ports: 绕过。
+port = 3002
 path = "/onebot/v11/ws"
 access_token = "${ONEBOT_ACCESS_TOKEN}"
 

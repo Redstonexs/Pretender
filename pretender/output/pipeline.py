@@ -131,9 +131,15 @@ class OutputPipeline:
         from pretender.output.split import SplitStage
         from pretender.output.typo import TypoStage
 
-        self.register(SanitizeStage())
+        self.register(SanitizeStage(max_length=self.config.max_length))
         self.register(SplitStage(max_split=self.config.max_split))
-        self.register(TypoStage(typo_rate=self.config.typo_rate))
+        self.register(
+            TypoStage(
+                typo_rate=self.config.typo_rate,
+                min_freq=self.config.typo_min_freq,
+                correction_probability=self.config.typo_correction_probability,
+            )
+        )
 
     # ── registration (delegates to the typed Registry) ──────────────────────
 
@@ -155,10 +161,20 @@ class OutputPipeline:
         """Registered stages in ``config.pipeline`` order.
 
         Fail-closed: an unknown stage name raises ``ConfigError`` (never
-        silently skipped). The configured sanitizer entry is ignored for
-        ordering and the mandatory core instance is appended last. An empty
-        pipeline uses all registered stages sorted by ``order``, followed by
-        the core sanitizer.
+        silently skipped). An empty pipeline uses all registered stages
+        sorted by ``order``.
+
+        The configured order is honoured EXACTLY as written, ``sanitize``
+        included — the default ``("sanitize", "split", "typo")`` means what
+        it says. This matters: split and typo must see cleaned text, because
+        the model's raw output can carry CQ codes and leaked tool blocks that
+        a cut would sever beyond repair. Previously the configured sanitize
+        entry was dropped and the core appended last, so split ran on raw
+        output and the config was a lie.
+
+        The mandatory core sanitizer still runs LAST as the safety boundary,
+        so a plugin stage cannot reintroduce leakage. ``sanitize_text`` is
+        idempotent, so the second pass is a no-op on already-clean text.
         """
         core = self._registry.get("sanitize")
         if core is None:
@@ -170,7 +186,7 @@ class OutputPipeline:
                     key=lambda s: s.order,
                 )
             )
-            return stages + (core,)
+            return (core,) + stages + (core,)
         result: list[OutputStage] = []
         for name in self.config.pipeline:
             stage = self._registry.get(name)
@@ -179,8 +195,10 @@ class OutputPipeline:
                     f"unknown output stage in pipeline: {name!r} "
                     f"(registered: {', '.join(self._registry.names())})"
                 )
-            if stage.name != "sanitize":
-                result.append(stage)
+            result.append(stage)
+        # Already ends with the core sanitizer: no point running it twice.
+        if result and result[-1] is core:
+            return tuple(result)
         return tuple(result) + (core,)
 
     def validate(self) -> None:

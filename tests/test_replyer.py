@@ -103,7 +103,9 @@ def test_reply_draft_basic():
     assert [m.role for m in msgs] == ["system", "user"]
     assert "你是麦麦" in msgs[0].content
     assert "自然" in msgs[0].content
-    assert msgs[1].content == "你好"
+    # The final user turn carries the staged reference plus the output
+    # instruction; with no ReplyContext there is no history and no clock.
+    assert "【回复信息参考】\n你好" in msgs[1].content
 
 
 def test_no_planner_analysis_in_input():
@@ -118,8 +120,10 @@ def test_no_planner_analysis_in_input():
         )
     )
     msgs = llm.calls[0][0]
-    assert msgs[1].content == "好的，我看看"
-    assert "分析" not in msgs[1].content
+    assert "好的，我看看" in msgs[1].content
+    # Nothing precedes the staged reference except the time / target blocks —
+    # the planner's analysis never enters the replyer transcript.
+    assert "分析" not in msgs[1].content.split("【回复信息参考】")[0]
     assert "tool_calls" not in msgs[1].content
     assert all(m.role in ("system", "user") for m in msgs)
 
@@ -239,3 +243,121 @@ def test_reply_draft_no_output_property():
 def test_replyer_prompt_name_constant():
     assert REPLYER_PROMPT == "replyer.txt"
     assert REPLY_PROFILE == "reply"
+
+
+# ── the replyer sees the conversation (MaiBot parity) ───────────────────────
+
+
+def _msg(text, *, is_self=False, name="小明", ts=1787990000.0, mid="1"):
+    from pretender.types import ChatKey, Message
+
+    return Message(
+        chat_key=ChatKey("qq:group:1"),
+        sender_id="9" if not is_self else "1",
+        sender_name=name,
+        is_self=is_self,
+        text=text,
+        id=mid,
+        recv_ts=ts,
+    )
+
+
+def _reply_with_context(ctx, reference="参考文本"):
+    from pretender.replyer import ReplyContext
+
+    replyer, llm = make_replyer([LLMResponse(content="好")])
+    run(
+        replyer.reply(
+            reply_reference=reference,
+            identity="你是群里的普通成员",
+            reply_style="自然",
+            context=ctx,
+        )
+    )
+    return llm.calls[0][0]
+
+
+def test_chat_history_becomes_role_tagged_turns():
+    """The bot's own messages are assistant turns, so the model reads its own
+    voice in the conversation rather than a transcript describing it."""
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(
+        ReplyContext(
+            chat_history=(
+                _msg("在吗"),
+                _msg("在的", is_self=True),
+                _msg("那你说说"),
+            ),
+            bot_name="麦麦",
+        )
+    )
+    assert [m.role for m in msgs] == ["system", "user", "assistant", "user", "user"]
+    assert msgs[2].content == "在的"
+    assert "小明: 在吗" in msgs[1].content
+
+
+def test_history_lines_carry_the_clock():
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(
+        ReplyContext(chat_history=(_msg("在吗"),), bot_name="麦麦")
+    )
+    assert msgs[1].content.startswith("[")
+    assert "] 小明: 在吗" in msgs[1].content
+
+
+def test_final_turn_carries_the_current_time():
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(ReplyContext(now=1787990000.0))
+    assert "当前时间：" in msgs[-1].content
+
+
+def test_final_turn_names_the_target_message():
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(
+        ReplyContext(target=_msg("你叫什么名字"), bot_name="麦麦")
+    )
+    assert "【你要回复的消息】" in msgs[-1].content
+    assert "你叫什么名字" in msgs[-1].content
+
+
+def test_bot_name_and_drift_reach_the_system_prompt():
+    from pretender.replyer import ReplyContext
+
+    from pretender.config import DriftConfig
+    from pretender.drift import build_drift_block
+
+    msgs = _reply_with_context(
+        ReplyContext(bot_name="bp", drift_block=build_drift_block(DriftConfig()))
+    )
+    assert "你的名字是bp" in msgs[0].content
+    assert "注意力漂移风格" in msgs[0].content
+
+
+def test_planner_chosen_length_becomes_an_instruction():
+    """MaiBot's ``reply`` tool ``reply_style``: the planner has read the room
+    and decides how long the reply should be."""
+    from pretender.replyer import LENGTH_DIRECTIVES, ReplyContext
+
+    msgs = _reply_with_context(ReplyContext(length_style="简短表达"))
+    assert LENGTH_DIRECTIVES["简短表达"] in msgs[-1].content
+    # "正常回复" carries no directive, so nothing is injected.
+    msgs = _reply_with_context(ReplyContext(length_style="正常回复"))
+    assert LENGTH_DIRECTIVES["简短表达"] not in msgs[-1].content
+
+
+def test_empty_history_entries_are_skipped():
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(
+        ReplyContext(chat_history=(_msg("  "), _msg("在吗")), bot_name="麦麦")
+    )
+    assert [m.role for m in msgs] == ["system", "user", "user"]
+
+
+def test_no_context_degrades_to_the_reference_only_request():
+    msgs = _reply_with_context(None)
+    assert [m.role for m in msgs] == ["system", "user"]

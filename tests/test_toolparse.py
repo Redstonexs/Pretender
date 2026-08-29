@@ -597,3 +597,120 @@ def test_property_random_structured_inputs_never_orphan(specs):
         assert len(result_ids) == len(set(result_ids)), (source, results)
         for cid in expected_ids:
             assert result_ids.count(cid) == 1, (source, results, cid)
+
+
+# ── the text lane: models that narrate their tool call ──────────────────────
+#
+# Some providers return ``finish_reason: "tool_calls"`` with ``tool_calls:
+# null`` and the call written out as markup in the assistant content. That was
+# a bot which ingested every message, triggered the gate, called the model and
+# then said nothing at all — the recovered call is the difference between a
+# reply and silence.
+
+def test_text_lane_recovers_function_parameter_markup(specs):
+    """The Hermes/MiMo shape, verbatim from a live provider response."""
+    content = (
+        '分析：Redstone_xs连续两次@麦麦并催促"说话"。\n\n'
+        "工具决策：<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Shanghai</parameter>\n"
+        "<parameter=unit>celsius</parameter>\n</function>\n</tool_call>"
+    )
+    (result,) = parse_tool_calls(content, specs)
+    assert result.ok
+    assert result.name == "get_weather"
+    assert result.data == {"city": "Shanghai", "unit": "celsius"}
+
+
+def test_text_lane_recovers_tool_name_markup(specs):
+    """The ``<tool_name>`` shape, also observed live."""
+    content = "我这就回复啦！<tool_call>\n<tool_name>get_weather</tool_name><city>Beijing</city></tool_call>"
+    (result,) = parse_tool_calls(content, specs)
+    assert result.ok and result.name == "get_weather"
+    assert result.data == {"city": "Beijing"}
+
+
+def test_text_lane_recovers_json_wrapped_in_tags(specs):
+    content = '<tool_call>{"name": "get_weather", "arguments": {"city": "Osaka"}}</tool_call>'
+    (result,) = parse_tool_calls(content, specs)
+    assert result.ok and result.data == {"city": "Osaka"}
+
+
+def test_text_lane_recovers_name_and_arguments_tags(specs):
+    """The inner ``<arguments>`` object must not shadow the wrapper: the JSON
+    extractor finds it first, and it names no tool on its own."""
+    content = '<tool_call><name>get_weather</name><arguments>{"city": "Kyoto"}</arguments></tool_call>'
+    (result,) = parse_tool_calls(content, specs)
+    assert result.ok and result.name == "get_weather"
+    assert result.data == {"city": "Kyoto"}
+
+
+def test_text_lane_accepts_bare_function_block(specs):
+    (result,) = parse_tool_calls("<function=get_weather><parameter=city>Lima</parameter></function>", specs)
+    assert result.ok and result.data == {"city": "Lima"}
+
+
+def test_text_lane_coerces_values_to_the_declared_schema_type(specs):
+    """Markup carries only text, so an ``integer`` parameter arrives as a
+    string and would otherwise fail schema validation."""
+    content = "<tool_call><function=add><parameter=a>2</parameter><parameter=b>40</parameter></function></tool_call>"
+    (result,) = parse_tool_calls(content, specs)
+    assert result.ok, result.error
+    assert result.data == {"a": 2, "b": 40}
+
+
+def test_text_lane_reports_a_genuine_schema_mismatch(specs):
+    """Coercion is best-effort: a value that will not convert is left alone so
+    the real mismatch is reported rather than hidden."""
+    content = "<tool_call><function=add><parameter=a>soon</parameter><parameter=b>1</parameter></function></tool_call>"
+    (result,) = parse_tool_calls(content, specs)
+    assert not result.ok
+    assert "schema mismatch" in (result.error or "")
+
+
+def test_text_lane_recovers_several_calls_in_order(specs):
+    content = (
+        "<tool_call><function=add><parameter=a>1</parameter><parameter=b>2</parameter></function></tool_call>\n"
+        "<tool_call><function=get_weather><parameter=city>Rome</parameter></function></tool_call>"
+    )
+    results = parse_tool_calls(content, specs)
+    assert [r.name for r in results] == ["add", "get_weather"]
+    assert len({r.call_id for r in results}) == 2
+
+
+def test_text_lane_ignores_an_unregistered_tool(specs):
+    """A synthetic id is minted ONLY for a tool the caller registered, so
+    markup naming anything else can never become a dispatchable call."""
+    content = "<tool_call><function=rm_rf><parameter=path>/</parameter></function></tool_call>"
+    assert parse_tool_calls(content, specs) == ()
+
+
+def test_text_lane_ignores_ordinary_prose(specs):
+    """Angle brackets outside an explicit wrapper are never a tool call."""
+    assert parse_tool_calls("I think a<b and c>d, so <blink>no</blink>.", specs) == ()
+
+
+def test_text_lane_does_not_reinterpret_malformed_json(specs):
+    """Ordering is strict: a JSON snippet that failed to parse still degrades
+    to no_action and keeps its id — the text lane never rescues it."""
+    (result,) = parse_tool_calls('{"id": "c9", "name": "add", "arguments": {"a": ', specs)
+    assert result.call_id == "c9"
+    assert result.name == NO_ACTION_NAME
+    assert not result.ok
+
+
+def test_id_less_json_naming_a_known_tool_is_recovered(specs):
+    """A model that emits a bare call object with no id used to be dropped
+    silently; the synthetic id keeps it dispatchable."""
+    (result,) = parse_tool_calls('{"name": "get_weather", "arguments": {"city": "Oslo"}}', specs)
+    assert result.ok and result.data == {"city": "Oslo"}
+
+
+def test_id_less_json_naming_nothing_is_still_ignored(specs):
+    assert parse_tool_calls('{"foo": 1, "bar": 2}', specs) == ()
+
+
+def test_provider_ids_are_never_replaced(specs):
+    """Synthetic ids are for id-less units only; a real provider id wins."""
+    source = {"tool_calls": [{"id": "call_1", "name": "add", "arguments": {"a": 1, "b": 2}}]}
+    (result,) = parse_tool_calls(source, specs)
+    assert result.call_id == "call_1"

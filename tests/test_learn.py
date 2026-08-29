@@ -623,7 +623,7 @@ def test_prompt_contains_untrusted_instruction_and_opaque_refs():
 
     prompt = run(scenario())
     assert "不可信数据" in prompt          # untrusted-data instruction
-    assert "麦麦自己" in prompt            # self-exclusion instruction
+    assert "机器人自己" in prompt          # self-exclusion instruction
     assert "[1] hello" in prompt          # opaque per-batch refs
     assert "[2] world" in prompt
 

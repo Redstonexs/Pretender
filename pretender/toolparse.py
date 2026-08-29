@@ -25,6 +25,20 @@ Recovery pipeline (per JSON text snippet):
   3. ONE caller-injected repair attempt (``repair=``) — invoked at most once
      per malformed snippet. If it raises or returns unparseable text, the
      call degrades to ``no_action`` rather than raising.
+  4. A TEXT lane (``_units_from_text_lane``) for models that narrate their
+     tool call instead of emitting a structured one — the Hermes/MiMo
+     ``<tool_call><function=NAME><parameter=KEY>…`` form and the
+     ``<tool_call><tool_name>NAME</tool_name>…`` form. It runs ONLY where the
+     JSON lanes above recovered nothing, never reinterprets malformed JSON,
+     and only inside an explicit ``<tool_call>``/``<function=…>`` wrapper so
+     ordinary prose can never become a call.
+
+A recovered call carries no provider id, so a deterministic synthetic id is
+assigned (``_finalize_text_units``) — but ONLY when the name is a tool the
+caller actually registered, so arbitrary text/JSON never becomes a call.
+Text-lane arguments arrive as strings and are coerced to the ``ToolSpec``
+parameter schema's declared type; JSON-sourced arguments keep the strict
+behaviour.
 
 ``arguments`` that arrive as a JSON *string* (the OpenAI convention) are
 decoded with the same pipeline; a non-object ``arguments`` (or an object that
@@ -55,6 +69,30 @@ NO_ACTION_NAME = "no_action"
 # salvage call ids from text that failed to decode as JSON at all, so a
 # referenced id is never orphaned.
 _ID_RE = re.compile(r"""["']?(?:call_id|id)["']?\s*[:=]\s*"?([A-Za-z0-9_.\-]+)"?""")
+
+# The text lane. Models that lack (or ignore) native function calling narrate
+# the call in the assistant content instead. These match ONLY inside an
+# explicit wrapper — never loose prose tags.
+_TOOL_CALL_BLOCK_RE = re.compile(r"<\s*tool_call\s*>(.*?)<\s*/\s*tool_call\s*>", re.S | re.I)
+_FUNCTION_BLOCK_RE = re.compile(
+    r"<\s*function\s*=\s*([A-Za-z0-9_.\-]+)\s*>(.*?)<\s*/\s*function\s*>", re.S | re.I
+)
+_PARAMETER_RE = re.compile(
+    r"<\s*parameter\s*=\s*([A-Za-z0-9_.\-]+)\s*>(.*?)<\s*/\s*parameter\s*>", re.S | re.I
+)
+_TAG_PAIR_RE = re.compile(r"<\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*>(.*?)<\s*/\s*\1\s*>", re.S)
+# The key a text-lane unit is flagged with; stripped before the unit is parsed.
+_TEXT_LANE_KEY = "__pretender_text_lane__"
+_XML_ENTITIES = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&apos;": "'",
+    "&#39;": "'",
+    "&nbsp;": " ",
+}
+_NAME_TAGS = ("tool_name", "function_name", "name", "tool")
+_ARGS_TAGS = ("arguments", "args", "parameters", "params")
 
 
 # ── public API ──────────────────────────────────────────────────────────────
@@ -94,6 +132,7 @@ def parse_tool_calls(
             _NoParse(cid, f"internal error: {type(exc).__name__}: {exc}")
             for cid in units
         ]
+    units = _finalize_text_units(units, specs)
     results: list[ToolResult] = []
     seen: set[str] = set()
     for unit in units:
@@ -209,11 +248,239 @@ def _units_from_text(text: str, repair: Callable[[str], str] | None) -> list[Any
             units.append(
                 _NoParse(extra, f"unparseable tool call fragment: {err or 'invalid JSON'}")
             )
+        if _has_usable_unit(units):
+            return units
+        # The decode succeeded but yielded nothing that names or answers a
+        # call — e.g. the model wrapped its call in tags and the extractor
+        # picked up only the inner ``<arguments>`` object. The text lane is
+        # the last chance to recover it; failing that, keep the JSON units so
+        # the existing drop/answer rules still apply.
+        return _units_from_text_lane(text) or units
+    units = _units_from_text_lane(text)
+    if units:
         return units
     ids = _extract_ids_from_text(text)
     if not ids:
         return []
     return [_NoParse(i, f"unparseable tool call: {err or 'invalid JSON'}") for i in ids]
+
+
+# ── the text lane ───────────────────────────────────────────────────────────
+
+def _units_from_text_lane(text: str) -> list[Any]:
+    """Recover tool calls a model narrated as markup instead of emitting them
+    structurally.
+
+    Two shapes are recognised, both only INSIDE an explicit wrapper so that
+    ordinary prose containing angle brackets can never become a call:
+
+      ``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>``
+      ``<tool_call><tool_name>NAME</tool_name><KEY>VALUE</KEY>…</tool_call>``
+
+    A bare ``<function=NAME>…</function>`` (no ``<tool_call>`` wrapper) is
+    accepted too — several models emit it that way. Returns text-lane units
+    (flagged mappings without ids); ``_finalize_text_units`` assigns the id
+    and coerces the argument types.
+    """
+    if not isinstance(text, str) or "<" not in text:
+        return []
+    units: list[Any] = []
+    blocks = [m.group(1) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
+    if not blocks:
+        # No wrapper: accept bare <function=NAME> blocks, nothing else.
+        if not _FUNCTION_BLOCK_RE.search(text):
+            return []
+        blocks = [text]
+    for body in blocks:
+        units.extend(_units_from_text_block(body))
+    return units
+
+
+def _units_from_text_block(body: str) -> list[Any]:
+    """Every call unit inside one wrapper body."""
+    units: list[Any] = []
+    matched_any = False
+    for match in _FUNCTION_BLOCK_RE.finditer(body):
+        matched_any = True
+        name = match.group(1).strip()
+        args = {
+            key.strip(): _unescape_markup(value)
+            for key, value in _PARAMETER_RE.findall(match.group(2))
+        }
+        if name:
+            units.append(_text_unit(name, args))
+    if matched_any:
+        return units
+    unit = _unit_from_tag_pairs(body)
+    return [unit] if unit is not None else []
+
+
+def _unit_from_tag_pairs(body: str) -> Any:
+    """The ``<tool_name>NAME</tool_name><KEY>VALUE</KEY>`` shape.
+
+    The first name-ish tag names the tool; an ``<arguments>`` tag holding a
+    JSON object supplies the arguments wholesale, otherwise every remaining
+    tag pair becomes one argument.
+    """
+    pairs = [(k.strip().lower(), v) for k, v in _TAG_PAIR_RE.findall(body)]
+    if not pairs:
+        return None
+    name = ""
+    for key, value in pairs:
+        if key in _NAME_TAGS:
+            name = _unescape_markup(value).strip()
+            break
+    if not name:
+        return None
+    for key, value in pairs:
+        if key in _ARGS_TAGS:
+            try:
+                decoded = json.loads(_unescape_markup(value))
+            except (ValueError, RecursionError):
+                decoded = None
+            if isinstance(decoded, Mapping):
+                return _text_unit(name, dict(decoded))
+    args = {
+        key: _unescape_markup(value)
+        for key, value in pairs
+        if key not in _NAME_TAGS and key not in _ARGS_TAGS
+    }
+    return _text_unit(name, args)
+
+
+def _has_usable_unit(units: list[Any]) -> bool:
+    """Whether any unit can actually answer or name a call. A decoded object
+    with neither an id nor a tool name (a stray argument object, say) is not a
+    call unit, and must not shadow the text lane."""
+    for unit in units:
+        if isinstance(unit, (_NoParse, ToolCall)):
+            return True
+        if isinstance(unit, Mapping) and (
+            _id_from_unit(unit) is not None or _unit_name(unit)
+        ):
+            return True
+    return False
+
+
+def _text_unit(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {_TEXT_LANE_KEY: True, "name": name, "arguments": arguments}
+
+
+def _unescape_markup(value: str) -> str:
+    """Undo the handful of entities models actually emit, then trim. Nothing
+    else is interpreted — the value is data, never markup."""
+    out = value
+    for entity, char in _XML_ENTITIES.items():
+        if entity in out:
+            out = out.replace(entity, char)
+    # ``&amp;`` last so ``&amp;lt;`` does not become ``<``.
+    if "&amp;" in out:
+        out = out.replace("&amp;", "&")
+    return out.strip()
+
+
+# ── finalization: synthetic ids + text-lane type coercion ───────────────────
+
+def _finalize_text_units(units: list[Any], specs: dict[str, dict[str, Any]]) -> list[Any]:
+    """Give id-less recovered units a deterministic id and coerce text-lane
+    arguments to their declared schema types.
+
+    An id is minted ONLY when the unit names a tool the caller registered —
+    arbitrary JSON or markup that happens to carry a ``name`` never becomes a
+    dispatchable call. Units that already carry an id are returned untouched,
+    so every structured/JSON path keeps its exact behaviour.
+    """
+    if not units:
+        return units
+    out: list[Any] = []
+    minted = 0
+    for unit in units:
+        text_lane = isinstance(unit, Mapping) and bool(unit.get(_TEXT_LANE_KEY))
+        if not isinstance(unit, Mapping) or _id_from_unit(unit) is not None:
+            if text_lane:
+                unit = {k: v for k, v in unit.items() if k != _TEXT_LANE_KEY}
+            out.append(unit)
+            continue
+        name = _unit_name(unit)
+        if not name or name not in specs:
+            # Unknown/absent tool name: leave the unit exactly as it was so it
+            # is dropped (or answered) by the existing rules.
+            out.append(unit)
+            continue
+        finalized = {k: v for k, v in unit.items() if k != _TEXT_LANE_KEY}
+        minted += 1
+        finalized["id"] = f"call_recovered_{minted}"
+        if text_lane:
+            args = finalized.get("arguments")
+            if isinstance(args, Mapping):
+                finalized["arguments"] = _coerce_text_arguments(args, specs[name])
+        out.append(finalized)
+    return out
+
+
+def _unit_name(unit: Mapping[str, Any]) -> str:
+    fn = unit.get("function")
+    name = fn.get("name") if isinstance(fn, Mapping) else None
+    if name is None:
+        name = unit.get("name")
+    return name.strip() if isinstance(name, str) else ""
+
+
+def _coerce_text_arguments(
+    arguments: Mapping[str, Any], parameters: Any
+) -> dict[str, Any]:
+    """Coerce string argument values to the types the schema declares.
+
+    Markup carries only text, so ``<parameter=seconds>5</parameter>`` would
+    otherwise fail a ``number`` schema. Applied to text-lane units only; a
+    value that will not convert is left alone so ``validate_arguments``
+    reports the real mismatch.
+    """
+    props = parameters.get("properties") if isinstance(parameters, Mapping) else None
+    if not isinstance(props, Mapping):
+        return dict(arguments)
+    out: dict[str, Any] = {}
+    for key, value in arguments.items():
+        schema = props.get(key)
+        out[key] = _coerce_text_value(value, schema) if isinstance(schema, Mapping) else value
+    return out
+
+
+def _coerce_text_value(value: Any, schema: Mapping[str, Any]) -> Any:
+    if not isinstance(value, str):
+        return value
+    declared = schema.get("type")
+    types = declared if isinstance(declared, list) else ([declared] if declared else [])
+    if not types:
+        return value
+    text = value.strip()
+    if "string" in types:
+        # A string already satisfies the schema; only an empty value for a
+        # nullable property is worth converting (an omitted <parameter> body).
+        return None if (not text and "null" in types) else value
+    for name in types:
+        if name == "null" and text.lower() in ("", "null", "none"):
+            return None
+        if name == "boolean" and text.lower() in ("true", "false"):
+            return text.lower() == "true"
+        if name == "integer":
+            try:
+                return int(text, 10)
+            except ValueError:
+                continue
+        if name == "number":
+            try:
+                return float(text)
+            except ValueError:
+                continue
+        if name in ("object", "array"):
+            try:
+                decoded = json.loads(text)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(decoded, Mapping if name == "object" else list):
+                return decoded
+    return value
 
 
 def _units_from_decoded(decoded: Any, repair: Callable[[str], str] | None) -> list[Any]:

@@ -140,6 +140,12 @@ class OutboxDriver:
                 continue
             pid = MessageId(platform_id) if platform_id is not None else None
             await self._repo.mark_outbox_sent(item.id, pid, ts)
+            log.info(
+                "outbox sent item %s to %s (platform_msg_id=%s)",
+                item.id,
+                chat_key,
+                pid,
+            )
             sent += 1
         return sent
 

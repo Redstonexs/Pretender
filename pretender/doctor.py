@@ -92,14 +92,29 @@ _REQUIRED_PROMPTS = ("identity.txt", "planner.txt", "replyer.txt", "planner_focu
 # The standard variable set each templated prompt must render with. A prompt
 # that references anything else is a broken asset, not a doctor bug.
 _PROMPT_VARIABLES: dict[str, dict[str, str]] = {
-    "planner.txt": {"identity": "probe", "chat_log": "", "reply_style": "probe"},
+    "planner.txt": {
+        "identity": "probe",
+        "chat_log": "",
+        "reply_style": "probe",
+        "bot_name": "probe",
+        "drift_block": "",
+    },
     "planner_focus.txt": {
         "identity": "probe",
         "chat_log": "",
         "reply_style": "probe",
         "focus_chat": "probe",
+        "bot_name": "probe",
+        "drift_block": "",
     },
-    "replyer.txt": {"identity": "probe", "reply_style": "probe", "reply_reference": ""},
+    # The reply reference is no longer a system-prompt slot: it rides in the
+    # final user turn, alongside the time and the target message.
+    "replyer.txt": {
+        "identity": "probe",
+        "reply_style": "probe",
+        "bot_name": "probe",
+        "drift_block": "",
+    },
 }
 
 # The minimal tool the tool-calling probe offers the provider.

@@ -79,6 +79,8 @@ from pretender.budget import (
     BudgetManager,
     BudgetedClient,
 )
+from datetime import datetime
+
 from pretender.clock import RealClock
 from pretender.config import (
     AgentConfig,
@@ -110,7 +112,8 @@ from pretender.registry import (
     configured_plugin_manifest,
     feature_implementation_fingerprint,
 )
-from pretender.replyer import Replyer
+from pretender.drift import build_drift_block
+from pretender.replyer import ReplyContext, Replyer
 from pretender.seams import LLMClient, Repository
 from pretender.session import is_focused
 from pretender.signals import is_other_assistant_target, normalize_text
@@ -186,6 +189,7 @@ def assemble_snapshot(
     cfg: ChatConfig,
     now: float,
     self_name: str | None,
+    self_aliases: tuple[str, ...] = (),
     previous_end_reason: str | None,
     window_s: float = SNAPSHOT_WINDOW_S,
     quote_self_ids: frozenset[MessageId] = frozenset(),
@@ -250,6 +254,7 @@ def assemble_snapshot(
         is_focused=is_focused(state, now),
         last_message=recent.messages[0] if recent.messages else None,
         self_name=self_name,
+        self_aliases=self_aliases,
         has_direct_at=any(self_id in m.mentions for m in pending),
         has_quote_to_self=_quote_to_self(pending, recent.messages, quote_self_ids),
         has_other_assistant=any(
@@ -372,12 +377,7 @@ class AdaptiveContextService:
         jargon = await self._jargon_for(
             chat_key, pending_text, recent_text, semantic=semantic
         )
-        reply_style = "自然"
-        for rec in expression:
-            style = (rec.payload or {}).get("style")
-            if isinstance(style, str) and style.strip():
-                reply_style = style.strip()
-                break
+        reply_style = _render_reply_style(expression)
         rendered, frozen = self._render(expression, jargon, summary, behavior)
         return AdaptiveContext(
             chat_key=chat_key,
@@ -841,8 +841,50 @@ repair: Callable[[str], str] | None = None,
             messages=messages,
             focus_chat=focus_chat,
             deadline=deadline,
+            recent=recent,
+            self_name=self_name,
             reply_style=style,
         )
+
+    def _reply_context(
+        self,
+        recent: Sequence[Message],
+        self_name: str | None,
+        reply_to: str | None,
+        length_style: str = "",
+    ) -> ReplyContext:
+        """The replyer's view of the conversation.
+
+        Built from the SAME ``recent`` snapshot the planner scored, so the two
+        stages never disagree about what was said. The drift block is a pure
+        function of config, so it costs nothing to compute here.
+        """
+        target = None
+        if reply_to:
+            for msg in recent:
+                if str(msg.id) == str(reply_to):
+                    target = msg
+                    break
+        return ReplyContext(
+            chat_history=tuple(recent),
+            target=target,
+            bot_name=self._bot_name(self_name),
+            now=self._now() if self._now is not None else None,
+            drift_block=self._drift_block(),
+            length_style=length_style or "",
+        )
+
+    def _bot_name(self, self_name: str | None) -> str:
+        """The name the prompts address the bot by."""
+        if self_name:
+            return self_name
+        return self._cfg.bot.name if self._cfg is not None else ""
+
+    def _drift_block(self) -> str:
+        """The attention-drift prompt block for this chat, or ``""``."""
+        if self._cfg is None:
+            return ""
+        return build_drift_block(self._cfg.drift)
 
     async def _run_injected(
         self,
@@ -854,6 +896,8 @@ repair: Callable[[str], str] | None = None,
         focus_chat: str | None,
         deadline: float | None,
         reply_style: str,
+        recent: Sequence[Message] = (),
+        self_name: str | None = None,
     ) -> AgentOutcome:
         """The injected-seam form: call the injected planner/replyer directly
         with NO saga-level budget accounting (the injected seams own their
@@ -864,6 +908,8 @@ repair: Callable[[str], str] | None = None,
             chat_log=chat_log,
             reply_style=reply_style,
             focus_chat=focus_chat,
+            bot_name=self._bot_name(self_name),
+            drift_block=self._drift_block(),
             tools=self._tools,
             temperature=self._temperature,
             max_tokens=self._max_tokens,
@@ -876,6 +922,9 @@ repair: Callable[[str], str] | None = None,
                 identity=identity,
                 reply_style=reply_style,
                 reply_to=result.reply_to,
+                context=self._reply_context(
+                    recent, self_name, result.reply_to, result.length_style
+                ),
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
                 deadline=deadline,
@@ -1030,6 +1079,8 @@ repair: Callable[[str], str] | None = None,
                 chat_log=chat_log,
                 reply_style=reply_style,
                 focus_chat=focus_chat,
+                bot_name=self._bot_name(self_name),
+                drift_block=self._drift_block(),
                 tools=self._tools,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
@@ -1069,6 +1120,9 @@ repair: Callable[[str], str] | None = None,
                     identity=identity,
                     reply_style=reply_style,
                     reply_to=result.reply_to,
+                    context=self._reply_context(
+                        recent, self_name, result.reply_to, result.length_style
+                    ),
                     temperature=self._temperature,
                     max_tokens=self._max_tokens,
                     deadline=deadline,
@@ -1172,20 +1226,71 @@ def _merge_usage(*usages: dict[str, int]) -> dict[str, int]:
     return out
 
 
+#: What the replyer is told when the expression learner has produced
+#: nothing yet (a fresh deployment, or [learn] disabled).
+DEFAULT_REPLY_STYLE = "自然"
+
+
+def _render_reply_style(expression: Sequence[Record]) -> str:
+    """Render the selected expression records into the replyer's style block.
+
+    MaiBot pairs each learned style with the SITUATION it was observed in
+    (``expression_learner`` records ``{situation, style}``) and shows the
+    replyer several of them, so the model can pick the one that fits the
+    current mood. Taking ``expression[0]["style"]`` and calling that the
+    entire style — which is what this did — discards the situation, discards
+    every other candidate, and collapses a learned repertoire into one word.
+
+    Records missing a usable style are skipped; an empty pool falls back to
+    ``DEFAULT_REPLY_STYLE``.
+    """
+    lines: list[str] = []
+    for rec in expression:
+        payload = rec.payload or {}
+        style = payload.get("style")
+        if not isinstance(style, str) or not style.strip():
+            continue
+        situation = payload.get("situation")
+        if isinstance(situation, str) and situation.strip():
+            lines.append(f"当{situation.strip()}时，{style.strip()}")
+        else:
+            lines.append(style.strip())
+    if not lines:
+        return DEFAULT_REPLY_STYLE
+    return "\n".join(lines)
+
+
 def _render_chat_log(recent: tuple[Message, ...], self_name: str | None) -> str:
     """The plain-text chat rendering the planner prompt embeds.
 
-    Each line renders the display name, the message text, and the exact
-    JSON-escaped sender UID (``[uid="..."]``) so the planner can pass the
-    UID verbatim as the ``platform_uid`` argument to
+    Each line renders the clock time, the display name, the message text, and
+    the exact JSON-escaped sender UID (``[uid="..."]``) so the planner can
+    pass the UID verbatim as the ``platform_uid`` argument to
     ``query_person_profile`` — no nickname lookup is ever performed.
+
+    The timestamp matters: this bot's gate deliberately delays replies by
+    minutes, so without it the model cannot tell a five-second-old message
+    from a twelve-hour-old one and answers stale conversations as if they
+    were live.
     """
     lines = []
     for msg in recent:
         name = self_name if msg.is_self else msg.sender_name
         uid = json.dumps(str(msg.sender_id), ensure_ascii=False)
-        lines.append(f"{name}: {msg.text} [uid={uid}]")
+        clock = _clock_hhmm(msg.recv_ts)
+        prefix = f"[{clock}] " if clock else ""
+        lines.append(f"{prefix}{name}: {msg.text} [uid={uid}]")
     return "\n".join(lines)
+
+
+def _clock_hhmm(ts: float | None) -> str:
+    """``HH:MM`` for a chat-log line, or ``""`` when the stamp is unusable."""
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def _pending_text(pending: tuple[Message, ...]) -> str:
@@ -1508,6 +1613,7 @@ class CycleRunner:
                 cfg=self._cfg.for_chat(chat_key),
                 now=now,
                 self_name=self._cfg.bot.name,
+                self_aliases=tuple(self._cfg.bot.alias_names),
                 previous_end_reason=previous_end_reason,
                 window_s=self._window_s,
                 quote_self_ids=quote_self_ids,
@@ -1610,6 +1716,7 @@ class CycleRunner:
             cfg=self._cfg.for_chat(chat_key),
             now=now,
             self_name=self._cfg.bot.name,
+            self_aliases=tuple(self._cfg.bot.alias_names),
             previous_end_reason=previous_end_reason,
             window_s=self._window_s,
             quote_self_ids=quote_self_ids,
@@ -1621,6 +1728,23 @@ class CycleRunner:
             self._trace_sink(trace)
         decision = trace.decision
         assert decision is not None
+        # The gate verdict is the first fork in "why did/didn't it speak".
+        # It exists in the ledger, but only the log answers the question
+        # while the operator is watching.
+        log.info(
+            "gate %s for %s: score=%.0f/%d pending=%d reason=%s delay=%s",
+            decision.action,
+            grant.claim.chat_key,
+            decision.score,
+            snapshot.trigger_score,
+            decision.pending,
+            decision.reason,
+            (
+                f"{decision.delay_seconds:.1f}s"
+                if decision.delay_seconds is not None
+                else "event-only"
+            ),
+        )
         if decision.action == "trigger":
             if self._agent is not None:
                 # Phase 3 agent lane: budget decide → planner tool loop →
@@ -1768,10 +1892,17 @@ class CycleRunner:
                 ),
                 deadline=deadline,
             )
-        except LLMTransientError:
+        except LLMTransientError as exc:
             # Recoverable provider failure/timeout: defer the retry
             # atomically (cursor/outbox unchanged) and return a timed
             # decision so the scheduler re-arms at resume_at.
+            log.warning(
+                "agent deferred for %s: transient provider failure (%s); "
+                "retrying in %.1fs",
+                grant.claim.chat_key,
+                exc,
+                agent_cfg.retry_delay_s,
+            )
             resume_at = self._clock.now() + agent_cfg.retry_delay_s
             await self._settle_defer(
                 grant,
@@ -1792,11 +1923,20 @@ class CycleRunner:
             # Leave the prepared owner for the scheduler's known-expiry
             # recovery path; never attempt a terminal finish as a stale owner.
             raise
-        except PermanentError:
+        except PermanentError as exc:
             # Any project-wide permanent failure (bad config/prompt/tool or
             # provider 4xx) will not succeed on retry: terminally consume the
             # cursor with an EMPTY outbox rather than creating a busy-retry
             # loop. The budget reservation is retained by BudgetedClient.
+            # This MUST be logged: an unreported 401/404 here is a bot that
+            # ingests everything, triggers, calls the provider and then stays
+            # silent forever with no other trace than an empty outbox.
+            log.warning(
+                "agent gave up for %s: permanent provider/config failure (%s); "
+                "settling with an empty outbox",
+                grant.claim.chat_key,
+                exc,
+            )
             await self._finish_dispatch(
                 grant,
                 "llm_permanent_error",
@@ -1887,7 +2027,12 @@ class CycleRunner:
             else:
                 end_reason = "reply_no_output"
         elif outcome.intent == "no_action":
-            end_reason = "no_action"
+            # Keep the planner's specific exit (no_tool_call / empty_response
+            # / tool_round_cap) — flattening them all to "no_action" makes a
+            # model that cannot emit tool calls indistinguishable from one
+            # that deliberately stayed quiet, which is the difference between
+            # a bug and normal behaviour.
+            end_reason = outcome.end_reason or "no_action"
         else:
             end_reason = "budget_blocked"
         if pre_send_failed:
@@ -1895,6 +2040,15 @@ class CycleRunner:
             # (the terminal finish persists an EMPTY outbox — nothing was
             # ever converted or persisted).
             end_reason = "pre_send_failed"
+        log.info(
+            "agent %s for %s: end_reason=%s outbox=%d tokens=%d/%d",
+            outcome.intent,
+            grant.claim.chat_key,
+            end_reason,
+            len(items),
+            outcome.tokens_in,
+            outcome.tokens_out,
+        )
         await self._finish_dispatch(
             grant,
             end_reason,

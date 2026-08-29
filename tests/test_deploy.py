@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -936,6 +938,252 @@ def test_plan_exposes_the_napcat_url_without_the_token(tmp_path):
     assert deploy.ONEBOT_ENV in text
 
 
+def test_deployment_default_port_is_3002_and_url_remains_centralized(tmp_path):
+    p = deploy.build_plan(
+        "compose", provider(), deploy.Features(), "onebot-token",
+        project_root=tmp_path / "project", home=tmp_path / "home",
+    )
+
+    assert deploy.DEFAULT_PORT == 3002
+    assert p.port == 3002
+    assert p.onebot_url == "ws://127.0.0.1:3002/onebot/v11/ws?message_format=array"
+    assert deploy.DEFAULT_ONEBOT_PATH in deploy.napcat_instructions(p)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        deploy.DEFAULT_IMAGE,
+        "registry.example.test/pretender:v2.4.0",
+        "registry.example.test:5443/pretender:stable-1",
+        "registry.example.test/pretender@sha256:" + "a" * 64,
+    ],
+)
+def test_image_reference_accepts_explicit_tag_or_digest(image):
+    assert deploy.validate_image_reference(image) == image
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "",
+        "registry.example.test/pretender",
+        "registry.example.test/pretender:latest",
+        "registry.example.test/pretender:LaTeSt",
+        "registry.example.test/pretender@sha256:abc",
+        " registry.example.test/pretender:v1",
+        "registry.example.test/pretender:v1 ",
+    ],
+)
+def test_image_reference_rejects_unpinned_or_malformed_images(image):
+    with pytest.raises(deploy.DeployError):
+        deploy.validate_image_reference(image)
+
+
+def test_build_plan_enforces_image_reference_contract(tmp_path):
+    with pytest.raises(deploy.DeployError, match="latest"):
+        deploy.build_plan(
+            "compose", provider(), deploy.Features(), "onebot-token",
+            project_root=tmp_path / "project", home=tmp_path / "home",
+            image="example.test/pretender:latest",
+        )
+
+
+def test_napcat_instructions_cover_docker_network_and_login_safety(tmp_path):
+    p = plan(tmp_path, "compose")
+    for language in ("zh", "en"):
+        deploy.set_language(language)
+        text = deploy.napcat_instructions(p)
+        assert "host" in text.lower()
+        assert "ports:" in text
+        assert "/app/.config/QQ" in text
+        assert "/app/napcat/config" in text
+        assert "message_format=array" in text
+        assert "ACCOUNT" in text
+        assert "NAPCAT_QUICK_PASSWORD" not in text
+        assert "onebot-token" not in text
+
+
+def test_shell_management_commands_are_reconcile_and_backup_safe():
+    source = (Path(deploy.__file__).resolve().parents[1] / "deploy.sh").read_text()
+
+    assert "./deploy.sh validate" in source
+    assert "./deploy.sh backup" in source
+    assert "compose restart" not in source
+    assert source.count("compose up -d --force-recreate") >= 2
+    assert "backup_database" in source
+    assert "compose pull" in source
+    assert "compose config --quiet" in source
+    assert "wait_for_core_liveness" in source
+    assert "pretender doctor" not in source
+    assert "PRAGMA integrity_check" in source
+    assert "docker exec" in source
+    assert "docker cp" in source
+    assert "mode=ro" in source
+    assert "os.O_EXCL" in source
+    assert "chown \"$backup_owner" not in source
+    assert "stat -c '%u:%g:%a:%F'" in source
+    assert "compose run" not in source
+    assert '"$backup_dir:/backup:rw"' not in source
+    assert "XDG_STATE_HOME" in source
+    assert "not a full volume backup" in source
+    assert "return 2" in source
+    assert 'chmod 700 "$backup_dir"' in source
+    assert 'chmod 600 "$backup_temp_path"' in source
+    executable_lines = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "down -v" not in executable_lines
+
+
+def test_shell_validate_reports_transport_only_and_distinct_missing_peer(tmp_path):
+    checkout = tmp_path / "checkout"
+    (checkout / "scripts").mkdir(parents=True)
+    (checkout / "config").mkdir()
+    shutil.copy2(Path(deploy.__file__).resolve().parents[1] / "deploy.sh", checkout / "deploy.sh")
+    (checkout / "scripts" / "deploy.py").write_text("# test marker\n")
+    (checkout / "docker-compose.yml").write_text("services: {}\n")
+    (checkout / ".env").write_text("PRETENDER_IMAGE=example.test/pretender:v1\n")
+    (checkout / "config" / "config.toml").write_text(
+        '[adapter.onebot]\nhost = "127.0.0.1"\nport = 3002\n'
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "docker").write_text(
+        """#!/usr/bin/env python3
+import os, sys
+
+args = sys.argv[1:]
+if args[:2] == ["compose", "version"] or args[:1] == ["info"]:
+    raise SystemExit(0)
+if args[:1] == ["compose"]:
+    if "ps" in args and "-q" in args:
+        print("live-container")
+    raise SystemExit(0)
+if args[:1] == ["ps"]:
+    print("live-container")
+    raise SystemExit(0)
+if args[:1] == ["inspect"]:
+    value = args[args.index("--format") + 1]
+    if "State.Status" in value:
+        print("running:true:false")
+    elif "Config.Image" in value:
+        print("example.test/pretender:v1")
+    elif "NetworkMode" in value:
+        print("host")
+    elif "config.toml" in value:
+        print("bind:false:" + os.environ["FAKE_ROOT"] + "/config/config.toml")
+    elif "/config/data" in value:
+        print("volume:pretender-data")
+    elif "RestartCount" in value:
+        print("0")
+    raise SystemExit(0)
+if args[:1] == ["exec"]:
+    script = args[args.index("-c") + 1]
+    if "tomllib" in script:
+        if os.environ.get("FAKE_TOPOLOGY", "1") != "1":
+            raise SystemExit(2)
+        print("3002")
+    elif "os.listdir" in script and "tcp6" in script:
+        print("%s %s" % (os.environ.get("FAKE_LISTENER", "1"), os.environ.get("FAKE_PEER", "0")))
+    raise SystemExit(0)
+raise SystemExit(0)
+"""
+    )
+    (fake_bin / "docker").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_ROOT": str(checkout),
+        "PRETENDER_LANG": "en",
+    }
+
+    with_peer = subprocess.run(
+        ["sh", str(checkout / "deploy.sh"), "validate"],
+        cwd=checkout, env={**env, "FAKE_PEER": "1"},
+        capture_output=True, text=True, check=False,
+    )
+    assert with_peer.returncode == 0
+    assert "transport peer established" in with_peer.stdout
+    assert "protocol readiness" in with_peer.stdout
+
+    without_peer = subprocess.run(
+        ["sh", str(checkout / "deploy.sh"), "validate"],
+        cwd=checkout, env={**env, "FAKE_PEER": "0"},
+        capture_output=True, text=True, check=False,
+    )
+    assert without_peer.returncode == 2
+    assert "not protocol-ready" in without_peer.stdout
+
+    no_listener = subprocess.run(
+        ["sh", str(checkout / "deploy.sh"), "validate"],
+        cwd=checkout, env={**env, "FAKE_LISTENER": "0", "FAKE_PEER": "0"},
+        capture_output=True, text=True, check=False,
+    )
+    assert no_listener.returncode == 1
+    assert "could not prove" in no_listener.stdout
+
+    topology_mismatch = subprocess.run(
+        ["sh", str(checkout / "deploy.sh"), "validate"],
+        cwd=checkout, env={**env, "FAKE_TOPOLOGY": "0"},
+        capture_output=True, text=True, check=False,
+    )
+    assert topology_mismatch.returncode == 1
+    assert "canonical path" in topology_mismatch.stdout
+
+
+def test_service_socket_probe_parses_tcp_and_tcp6_and_requires_fd_ownership(tmp_path):
+    source = (Path(deploy.__file__).resolve().parents[1] / "deploy.sh").read_text()
+    start = source.index("validation_socket_probe='") + len("validation_socket_probe='")
+    end = source.index("'\n        validation_socket_probe_result=", start)
+    probe = source[start:end]
+    port = 3003
+    port_hex = f"{port:04X}"
+
+    def tcp_row(address, state, inode):
+        return (
+            f"0: {address}:{port_hex} 00000000:0000 {state} "
+            "00000000:00000000 00:00000000 00000000 1000 0 "
+            f"{inode} 1"
+        )
+
+    def make_proc(root, fd_inodes, tcp_rows, tcp6_rows):
+        (root / "1" / "fd").mkdir(parents=True)
+        (root / "net").mkdir()
+        for descriptor, inode in enumerate(fd_inodes, 3):
+            (root / "1" / "fd" / str(descriptor)).symlink_to(f"socket:[{inode}]")
+        (root / "net" / "tcp").write_text("header\n" + "\n".join(tcp_rows) + "\n")
+        (root / "net" / "tcp6").write_text("header\n" + "\n".join(tcp6_rows) + "\n")
+
+    owned = tmp_path / "proc-owned"
+    make_proc(
+        owned,
+        [111, 222],
+        [tcp_row("0100007F", "0A", 111)],
+        [tcp_row("00000000000000000000000001000000", "01", 222)],
+    )
+    result = subprocess.run(
+        ["python3", "-c", probe, str(port), str(owned)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "1 1"
+
+    mismatched = tmp_path / "proc-mismatched"
+    make_proc(
+        mismatched,
+        [111],
+        [tcp_row("0100007F", "0A", 999)],
+        [tcp_row("00000000000000000000000001000000", "01", 999)],
+    )
+    result = subprocess.run(
+        ["python3", "-c", probe, str(port), str(mismatched)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "0 0"
+
+
 # ── language ────────────────────────────────────────────────────────────────
 
 
@@ -1087,3 +1335,144 @@ def test_generated_env_and_config_agree_on_the_port_and_secrets(tmp_path, monkey
     assert cfg.adapter.onebot.access_token == "b" * 64
     assert cfg.llm.profile("planner").api_key == "sk-live-key"
     assert "sk-live-key" not in p.config_path.read_text()
+
+
+# ── the generated config must expose the reply gate ─────────────────────────
+#
+# The wizard used to emit only llm/output/media/adapter/storage. With no
+# ``[gate]`` section there is nothing in the file for an operator to turn, and
+# at the dataclass default (trigger_score 80) an unaddressed group message
+# tops out around 66 — so the bot was structurally @-only with no visible
+# switch. "I am not finding any switch to let it talk" is that gap.
+
+def test_render_config_exposes_the_gate(tmp_path, monkeypatch):
+    text = deploy.render_config(provider(), deploy.Features(), "data/pretender.db")
+    assert "[gate]" in text
+    assert "[bot]" in text
+    assert "[log]" in text
+
+    monkeypatch.setenv(deploy.LLM_ENV, "secret")
+    monkeypatch.setenv(deploy.ONEBOT_ENV, "token")
+    cfg = Config.loads(text)
+    assert cfg.gate.threshold == deploy.DEFAULT_GATE_THRESHOLD
+    assert cfg.gate.trigger_score == deploy.DEFAULT_GATE_TRIGGER_SCORE
+    assert cfg.bot.name == deploy.DEFAULT_BOT_NAME
+    assert cfg.log.dir == "logs"
+
+
+def test_generated_trigger_score_lets_the_bot_join_a_conversation():
+    """Below the dataclass default of 80, which no unaddressed group message
+    can reach."""
+    assert deploy.DEFAULT_GATE_TRIGGER_SCORE < 80
+
+
+def test_render_config_documents_how_to_retune_the_gate():
+    """The switch is only a switch if the file says what it does."""
+    text = deploy.render_config(provider(), deploy.Features(), "data/pretender.db")
+    gate_comments = [
+        line for line in text.splitlines()
+        if line.startswith("#") and ("trigger_score" in line or "threshold" in line)
+    ]
+    assert gate_comments
+
+
+# ── the adaptive stack reaches the generated config ─────────────────────────
+
+
+def _zen(**kw):
+    from scripts.deploy import Provider
+
+    return Provider(
+        "https://opencode.ai/zen/v1",
+        "ling-3.0-flash-fin-free",
+        "ling-3.0-flash-fin-free",
+        "sk-x",
+        **kw,
+    )
+
+
+def test_generated_config_enables_the_learners():
+    """Without [learn] the reply style is frozen at 自然 forever, which is
+    what the first deployment shipped."""
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "[learn]\nenabled = true" in text
+    for learner in ("expression", "behavior", "jargon", "summary", "effect"):
+        assert f"[learn.profiles.{learner}]" in text
+
+
+def test_generated_config_carries_drift():
+    """[drift] used to be parsed and read by nothing."""
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert '[drift]\nlevel = "active"' in text
+
+
+def test_vision_profile_is_written_only_when_the_provider_has_one():
+    """"Supports vision" means the model READS the image. opencode.ai/zen's
+    hy3-free returns HTTP 200 for an image part and then answers "you did not
+    upload an image" — accepting the request shape is not the same thing."""
+    from scripts.deploy import Features, Provider, render_config
+
+    openai = Provider(
+        "https://api.openai.com/v1", "gpt-4o-mini", "gpt-4o-mini", "sk-x"
+    )
+    text = render_config(openai, Features(media_enabled=True), "data/p.db")
+    assert "[llm.profiles.vision]" in text
+    assert 'model = "gpt-4o-mini"' in text
+    assert "[media]\nenabled = true" in text
+
+    for base, planner in (
+        ("https://api.deepseek.com/v1", "deepseek-chat"),
+        ("https://opencode.ai/zen/v1", "ling-3.0-flash-fin-free"),
+    ):
+        text = render_config(
+            Provider(base, planner, planner, "sk-x"),
+            Features(media_enabled=True),
+            "data/p.db",
+        )
+        # Present only as a commented-out stub explaining why there is none.
+        assert "[llm.profiles.vision]" not in text.replace(
+            "# [llm.profiles.vision]", ""
+        )
+        assert "# No vision profile" in text
+        # Media needs vision to describe an incoming image, so it stays off.
+        assert "[media]\nenabled = false" in text
+
+
+def test_missing_embeddings_are_explained_not_silently_omitted():
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "[llm.profiles.embed]" not in text.replace("# [llm.profiles.embed]", "")
+    assert "# No embed profile" in text
+
+
+def test_typo_rate_matches_maibot():
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "typo_rate = 0.01" in text
+
+
+def test_generated_config_loads(tmp_path, monkeypatch):
+    from scripts.deploy import Features, render_config
+
+    from pretender.config import load_config
+
+    monkeypatch.setenv("PRETENDER_LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "tok")
+    path = tmp_path / "config.toml"
+    path.write_text(
+        render_config(_zen(), Features(media_enabled=True), "data/p.db"),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert sorted(cfg.llm.profiles) == ["planner", "reply"]
+    assert cfg.learn.enabled and len(cfg.learn.profiles) == 5
+    assert cfg.drift.level == "active"
+    # No vision on this provider, so media degrades off rather than harvesting
+    # stickers it can never describe.
+    assert cfg.media.enabled is False

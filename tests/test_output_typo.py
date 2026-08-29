@@ -30,7 +30,9 @@ def test_typo_stage_honors_switches_and_parts():
     out = _out("我在这里")
     out.parts = ["我在这里", "你在那边"]
     stage.apply(out)
-    assert out.parts and len(out.parts) == 2
+    # Two input parts, plus at most one correction bubble (MaiBot sends the
+    # correct word as its own message after a typo).
+    assert out.parts and 2 <= len(out.parts) <= 3
     disabled = _out("我在这里")
     disabled.enable_chinese_typo = False
     stage.apply(disabled)

@@ -333,7 +333,10 @@ def test_adaptive_context_expression_becomes_reply_style(tmp_path):
         return ctx
 
     ctx = run(scenario())
-    assert ctx.reply_style == "活泼"
+    # MaiBot pairs each learned style with the situation it was observed in
+    # and shows the replyer the whole pool, so the model can pick the one
+    # that fits. Collapsing it to expression[0]["style"] threw that away.
+    assert ctx.reply_style == "当greeting时，活泼\n当farewell时，温柔"
     assert len(ctx.expression) == 2
     assert "【自适应参考】" in ctx.rendered
     assert "活泼" in ctx.rendered

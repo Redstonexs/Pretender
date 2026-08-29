@@ -1,11 +1,30 @@
 """Phase 3 replyer: render the bot's visible reply text.
 
-This module owns ONLY the reply lane: it renders the ``replyer`` prompt
-from the planner's staged ``reply_reference`` and returns a typed, frozen
-``ReplyDraft``. It never invokes tools and never sends output — the only
-LLM call is ``LLMClient.complete`` on profile ``"reply"`` — and its
-transcript never contains planner analysis or tool JSON: the user turn
-carries only the staged reply-reference text.
+This module owns ONLY the reply lane: it renders the ``replyer`` prompt and
+returns a typed, frozen ``ReplyDraft``. It never invokes tools and never
+sends output — the only LLM call is ``LLMClient.complete`` on profile
+``"reply"``.
+
+**The replyer sees the conversation.** It used to receive nothing but the
+planner's staged ``reply_reference`` string, which made it a paraphraser:
+asked to write a group-chat message with no idea what the group was talking
+about, what time it was, or who it was answering. That is the difference
+between a reply and a plausible-sounding sentence.
+
+The request now mirrors MaiBot's
+``maisaka_generator_base._build_request_messages``:
+
+  1. system — the ``replyer`` prompt with identity, reply style, bot name and
+     the attention-drift block
+  2. the recent chat as REAL role-tagged turns (``is_self`` → assistant,
+     everyone else → user), so the model reads the conversation rather than a
+     summary of it
+  3. a final user turn carrying the current time, the message being replied
+     to, the planner's non-binding reference, any length directive, and the
+     output instruction
+
+Planner analysis and tool JSON still never enter the transcript — only real
+chat messages and the staged reference do.
 
 The model's raw output is guarded before it can reach a user: empty /
 non-string content, code-fenced blocks wrapping structured JSON, and
@@ -17,16 +36,52 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import datetime
+from typing import Any, Sequence
 
 from pretender.prompts import PromptStore
 from pretender.seams import LLMClient
-from pretender.types import TranscriptMessage
+from pretender.types import Message, TranscriptMessage
 
 REPLY_PROFILE = "reply"
 REPLYER_PROMPT = "replyer.txt"
 
-__all__ = ["REPLY_PROFILE", "REPLYER_PROMPT", "ReplyDraft", "Replyer"]
+#: MaiBot's ``reply`` tool length directives, keyed by its own argument
+#: values. The PLANNER decides how long the reply should be; the replyer is
+#: told, rather than guessing from the reference text.
+LENGTH_DIRECTIVES = {
+    "简短表达": (
+        "请简短的回复，允许句子残缺，奇怪表达，倒装，省略，"
+        "符合口语习惯，符合省力随意回复习惯"
+    ),
+    "正常回复": "",
+    "长回复": "可以针对问题做出较为详细的评论和说明",
+}
+
+__all__ = [
+    "LENGTH_DIRECTIVES",
+    "REPLY_PROFILE",
+    "REPLYER_PROMPT",
+    "ReplyContext",
+    "ReplyDraft",
+    "Replyer",
+]
+
+
+@dataclass(frozen=True)
+class ReplyContext:
+    """Everything the replyer needs beyond the planner's reference.
+
+    Every field is optional so an injected/test Replyer keeps working with no
+    context at all — it simply degrades to the old reference-only request.
+    """
+
+    chat_history: tuple[Message, ...] = ()
+    target: Message | None = None
+    bot_name: str = ""
+    now: float | None = None
+    drift_block: str = ""
+    length_style: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,31 +161,37 @@ class Replyer:
         identity: str,
         reply_style: str,
         reply_to: str | None = None,
+        context: ReplyContext | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         deadline: float | None = None,
     ) -> ReplyDraft:
-        """Render a reply draft from the planner's staged reference.
+        """Render a reply draft.
 
         An empty / missing ``reply_reference`` short-circuits to a safe
-        no-output draft without calling the LLM. The transcript is exactly
-        ``[system(replyer prompt), user(reply_reference)]`` — planner
-        analysis and tool JSON never enter it.
+        no-output draft without calling the LLM. ``context`` carries the chat
+        history, target message, clock and drift block; omitting it degrades
+        to the reference-only request.
         """
         if not isinstance(reply_reference, str) or not reply_reference.strip():
             return ReplyDraft.empty(reply_to=reply_to)
         if not isinstance(identity, str) or not isinstance(reply_style, str):
             raise ValueError("identity and reply_style must be strings")
+        ctx = context or ReplyContext()
         prompt_text = self._prompts.render(
             self._prompt_name,
             identity=identity,
             reply_style=reply_style,
-            reply_reference=reply_reference,
+            bot_name=ctx.bot_name,
+            drift_block=ctx.drift_block,
         )
-        transcript = [
-            TranscriptMessage(role="system", content=prompt_text),
-            TranscriptMessage(role="user", content=reply_reference),
-        ]
+        transcript = [TranscriptMessage(role="system", content=prompt_text)]
+        transcript.extend(_history_turns(ctx.chat_history, ctx.bot_name))
+        transcript.append(
+            TranscriptMessage(
+                role="user", content=_final_turn(reply_reference, ctx)
+            )
+        )
         resp = await self._llm.complete(
             transcript,
             profile=self._profile,
@@ -155,6 +216,70 @@ class Replyer:
             tokens_in=tokens_in,
             tokens_out=tokens_out,
         )
+
+
+# ── request assembly ─────────────────────────────────────────────────────────
+
+
+def _clock_time(ts: float | None) -> str:
+    """``HH:MM`` for one message line."""
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _history_turns(
+    history: Sequence[Message], bot_name: str
+) -> list[TranscriptMessage]:
+    """The recent chat as role-tagged turns.
+
+    The bot's own messages become ``assistant`` turns so the model sees its
+    own voice in the conversation rather than a transcript describing it.
+    Everyone else becomes a ``user`` turn prefixed with the speaker and the
+    clock time — a group chat has many speakers, and a reply that ignores who
+    said what reads as a bot.
+    """
+    turns: list[TranscriptMessage] = []
+    for msg in history:
+        text = (msg.text or "").strip()
+        if not text:
+            continue
+        if msg.is_self:
+            turns.append(TranscriptMessage(role="assistant", content=text))
+            continue
+        clock = _clock_time(msg.recv_ts)
+        name = msg.sender_name or bot_name or "某人"
+        prefix = f"[{clock}] {name}: " if clock else f"{name}: "
+        turns.append(TranscriptMessage(role="user", content=prefix + text))
+    return turns
+
+
+def _final_turn(reply_reference: str, ctx: ReplyContext) -> str:
+    """The closing user turn: time, target, reference, length, instruction."""
+    sections: list[str] = []
+    if ctx.now is not None:
+        try:
+            stamp = datetime.fromtimestamp(ctx.now).strftime("%Y-%m-%d %H:%M:%S")
+            sections.append(f"当前时间：{stamp}")
+        except (OverflowError, OSError, ValueError):
+            pass
+    if ctx.target is not None and (ctx.target.text or "").strip():
+        speaker = ctx.target.sender_name or "对方"
+        sections.append(
+            f"【你要回复的消息】\n{speaker}: {ctx.target.text.strip()}"
+        )
+    sections.append(f"【回复信息参考】\n{reply_reference.strip()}")
+    directive = LENGTH_DIRECTIVES.get(ctx.length_style.strip(), "")
+    if directive:
+        sections.append(directive)
+    sections.append(
+        "请自然地回复。只输出你要发到群里的内容本身，"
+        "不要输出分析、括号动作描写、@ 或任何额外标记。"
+    )
+    return "\n\n".join(sections)
 
 
 # ── output guard ─────────────────────────────────────────────────────────────

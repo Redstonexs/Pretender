@@ -73,6 +73,10 @@ __all__ = [
 #: the two deferred Phase 5 knowledge tools, the Phase 6 P6.4b jargon tool,
 #: the two Phase 6 P6.5b media send tools, and the two Phase 6 P6.6b
 #: chat-control tools).
+#: MaiBot's ``reply`` tool length directives. The planner picks one; the
+#: replyer turns it into an instruction (see ``replyer.LENGTH_DIRECTIVES``).
+REPLY_LENGTH_STYLES: tuple[str, ...] = ("简短表达", "正常回复", "长回复")
+
 CORE_TOOL_NAMES: tuple[str, ...] = (
     "reply",
     "wait",
@@ -232,6 +236,9 @@ class ToolContext:
         # settlement. NOT mutually exclusive with the text verdicts — a
         # control rides along with the round's terminal intent.
         self._chat_controls: list[ChatControlIntent] = []
+        # The planner's chosen reply length (MaiBot's ``reply_style`` tool
+        # argument); "" means no preference.
+        self._reply_length_style: str = ""
 
     # ── read-only outcome accessors ─────────────────────────────────────────
 
@@ -242,6 +249,11 @@ class ToolContext:
     @property
     def reply_to(self) -> str | None:
         return self._reply_to
+
+    @property
+    def reply_length_style(self) -> str:
+        """The planner's chosen reply length, or ``""`` for the default."""
+        return self._reply_length_style
 
     @property
     def wait_seconds(self) -> float | None:
@@ -268,8 +280,19 @@ class ToolContext:
 
     # ── core tool handlers (the ``self`` param is the live context) ─────────
 
-    def reply(self, text: str, reply_to: str | None = None) -> str:
+    def reply(
+        self,
+        text: str,
+        reply_to: str | None = None,
+        reply_style: str | None = None,
+    ) -> str:
         """Stage the bot's visible reply text (the replyer's input).
+
+        ``reply_style`` is how long the reply should be — ``简短表达``,
+        ``正常回复`` or ``长回复``. The planner has read the conversation and
+        knows whether this moment wants a two-character reaction or a real
+        explanation, so it decides; the replyer is told rather than inferring
+        length from the reference text. Anything else is ignored.
 
         The LAST ``reply`` call wins and clears any staged ``wait`` or
         ``no_action``. A staged media send (``send_emoji``/``send_image``)
@@ -285,6 +308,9 @@ class ToolContext:
             )
         self._reply_text = text
         self._reply_to = reply_to
+        self._reply_length_style = (
+            reply_style if reply_style in REPLY_LENGTH_STYLES else ""
+        )
         self._wait_seconds = None
         self._no_action = False
         return json.dumps(

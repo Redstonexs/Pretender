@@ -167,6 +167,7 @@ class OneBotAdapter:
         self._expected_self_id = self._self_id
         self._generation_self_id: str | None = None
         self._identity_conflict = False
+        self._ready_log_generation: int | None = None
 
         # echo -> future for in-flight API actions (send/call).
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -207,6 +208,10 @@ class OneBotAdapter:
         # echo/probe (see ``ready``).
         self._lifecycle_seen = False
         self._probe_ok = False
+        # The PLATFORM account's own session state, as reported by heartbeat
+        # ``status.online``. Distinct from transport/readiness: None until a
+        # heartbeat says otherwise.
+        self._platform_online: bool | None = None
 
     # ── Adapter protocol ────────────────────────────────────────────────────
 
@@ -531,6 +536,11 @@ class OneBotAdapter:
             self._conn = conn
             self._note_activity()
             self._conn_event.set()
+            log.info(
+                "onebot connection generation adopted/reset: generation=%d; "
+                "awaiting readiness",
+                generation,
+            )
             await self._probe(conn, generation)
             return generation
 
@@ -678,6 +688,7 @@ class OneBotAdapter:
         # reconnect must prove lifecycle/self-id and API echo again.
         self._probe_ok = False
         self._lifecycle_seen = False
+        self._platform_online = None
         self._generation_self_id = None
         self._identity_conflict = False
         self._ready_event.clear()
@@ -745,6 +756,9 @@ class OneBotAdapter:
                 expected_generation=generation,
             )
             resp = await asyncio.wait_for(fut, timeout=self._cfg.action_timeout_s)
+            if resp.get("retcode") != 0:
+                await self._fail_probe(conn, generation, "failed")
+                return
             if (
                 resp.get("retcode") == 0
                 and self._conn is conn
@@ -754,15 +768,13 @@ class OneBotAdapter:
                 sid = str(data.get("user_id") or "").strip()
                 if sid:
                     if self._expected_self_id and sid != self._expected_self_id:
-                        self._identity_conflict = True
-                        self._ready_event.clear()
-                        try:
-                            await conn.close(
-                                CloseCode.POLICY_VIOLATION,
-                                "onebot self_id mismatch",
-                            )
-                        except Exception:
-                            pass
+                        self._mark_identity_conflict(generation)
+                        await self._close_current_generation(
+                            conn,
+                            generation,
+                            CloseCode.TRY_AGAIN_LATER,
+                            "onebot self_id mismatch",
+                        )
                         return
                     if self._expected_self_id is None:
                         self._expected_self_id = sid
@@ -772,10 +784,80 @@ class OneBotAdapter:
                 self._probe_ok = True
                 if self.ready:
                     self._ready_event.set()
-        except (asyncio.TimeoutError, ConnectionClosed, OSError):
-            pass
+                    self._log_ready(generation)
+        except asyncio.TimeoutError:
+            await self._fail_probe(conn, generation, "timed out")
+        except ConnectionClosed:
+            await self._fail_probe(conn, generation, "connection closed")
+        except OSError:
+            await self._fail_probe(conn, generation, "connection error")
+        except Exception:
+            # Keep unexpected probe failures contained to this generation, as
+            # before, but make the not-ready state visible without exposing
+            # exception text that could contain protocol data or credentials.
+            await self._fail_probe(conn, generation, "failed")
         finally:
             self._pending.pop(echo, None)
+
+    async def _fail_probe(
+        self, conn: Any, generation: int, reason: str
+    ) -> None:
+        """Fail and close only the still-current generation's probe socket."""
+        async with self._adopt_lock:
+            if self._conn is not conn or self._connection_generation != generation:
+                return
+            self._log_probe_failure(generation, reason)
+            try:
+                await conn.close(
+                    CloseCode.TRY_AGAIN_LATER,
+                    "onebot readiness probe failed",
+                )
+            except Exception:
+                pass
+
+    async def _close_current_generation(
+        self,
+        conn: Any,
+        generation: int,
+        code: CloseCode,
+        reason: str,
+    ) -> None:
+        """Close a generation only while it remains the adopted connection."""
+        async with self._adopt_lock:
+            if self._conn is not conn or self._connection_generation != generation:
+                return
+            try:
+                await conn.close(code, reason)
+            except Exception:
+                pass
+
+    def _log_probe_failure(self, generation: int, reason: str) -> None:
+        """Log a secret-free readiness failure for one connection generation."""
+        log.warning(
+            "onebot readiness probe %s: generation=%d; adapter remains "
+            "not-ready and waits for reconnect",
+            reason,
+            generation,
+        )
+
+    def _log_ready(self, generation: int) -> None:
+        """Log the first ready transition for a generation only."""
+        if self._ready_log_generation == generation or not self.ready:
+            return
+        self._ready_log_generation = generation
+        log.info("onebot readiness established: generation=%d", generation)
+
+    def _mark_identity_conflict(self, generation: int | None = None) -> None:
+        """Record and report an identity conflict without logging either id."""
+        was_conflict = self._identity_conflict
+        self._identity_conflict = True
+        self._ready_event.clear()
+        if not was_conflict:
+            log.warning(
+                "onebot identity mismatch: generation=%d; adapter remains "
+                "not-ready and will wait for reconnect",
+                self._connection_generation if generation is None else generation,
+            )
 
     @property
     def ready(self) -> bool:
@@ -825,11 +907,48 @@ class OneBotAdapter:
             and data.get("meta_event_type") == "lifecycle"
         ):
             self._lifecycle_seen = True
+        elif (
+            data.get("post_type") == "meta_event"
+            and data.get("meta_event_type") == "heartbeat"
+        ):
+            self._note_platform_online(data)
         # API response (echo correlation) — carries echo, no post_type.
         if "echo" in data and "post_type" not in data:
             self._resolve_echo(data)
             return None
         return await self._normalize_event(data)
+
+    def _note_platform_online(self, data: dict) -> None:
+        """Log transitions of the PLATFORM account's login state.
+
+        A heartbeat's ``status.online`` is the account's own session, not the
+        transport. The two diverge in the worst possible way: the OneBot
+        implementation keeps its socket open, keeps sending heartbeats and
+        keeps answering ``get_login_info`` — so the adapter reaches ``ready``
+        and everything looks healthy — while the account is logged out and NO
+        message can ever arrive. Observed in production as a bot that had been
+        silently unreachable for 20 hours.
+
+        Only transitions are logged; a heartbeat every 30 s must not become a
+        log flood.
+        """
+        status = data.get("status")
+        online = status.get("online") if isinstance(status, dict) else None
+        if not isinstance(online, bool) or online is self._platform_online:
+            return
+        self._platform_online = online
+        if online:
+            log.info(
+                "onebot platform account is online: self_id=%s", self._self_id
+            )
+        else:
+            log.warning(
+                "onebot platform account is OFFLINE: self_id=%s. The OneBot "
+                "implementation is still connected, but the account is not "
+                "logged in, so no message can be received or sent. Re-login "
+                "the platform client (NapCat: scan the QR in its WebUI).",
+                self._self_id,
+            )
 
     def _learn_self_id(self, data: dict, *, generation: int | None = None) -> None:
         """Learn the real self id from any inbound OneBot event that carries
@@ -843,20 +962,23 @@ class OneBotAdapter:
             return
         if sid:
             if self._expected_self_id and sid != self._expected_self_id:
-                self._identity_conflict = True
-                self._ready_event.clear()
+                self._mark_identity_conflict(generation)
                 return
             if self._expected_self_id is None:
                 self._expected_self_id = sid
             if self._generation_self_id and sid != self._generation_self_id:
-                self._identity_conflict = True
-                self._ready_event.clear()
+                self._mark_identity_conflict(generation)
                 return
             self._generation_self_id = sid
             self._self_id = sid
             self._lifecycle_seen = True
             if self._probe_ok and self.connected and not self._identity_conflict:
                 self._ready_event.set()
+                self._log_ready(
+                    self._connection_generation
+                    if generation is None
+                    else generation
+                )
 
     def _resolve_echo(self, data: dict) -> None:
         echo = data.get("echo")

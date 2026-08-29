@@ -87,7 +87,7 @@ def test_specs_prompt_files_exist():
         text = path.read_text(encoding="utf-8")
         # Self-exclusion + untrusted-data instruction in every prompt.
         assert "不可信数据" in text, f"{spec.prompt} lacks the untrusted-data instruction"
-        assert "麦麦自己" in text, f"{spec.prompt} lacks the self-exclusion instruction"
+        assert "机器人自己" in text, f"{spec.prompt} lacks the self-exclusion instruction"
         # The model is told never to set weight/uses/delta.
         assert "weight" in text and "delta" in text
 

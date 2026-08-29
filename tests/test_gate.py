@@ -1166,3 +1166,119 @@ def test_frequency_scale_formula():
     assert _decision(trace).score == 0.0
     bad = _gate().evaluate(_snap("hi", frequency=-2.0))
     assert _decision(bad).reason == Reason.FEATURE_FAILURE  # negative scale
+
+# ── the clamped-idle runaway ────────────────────────────────────────────────
+#
+# ``assemble_snapshot`` pins ``idle_seconds`` to the 300 s presence window when
+# the window holds no non-self message. That is a LOWER BOUND, not the real
+# idle time. Arithmetic that treats it as the truth never converges: production
+# wrote 3,660 timer dispatches over 12.8 h, one every 11.6 s, each one
+# re-deriving the identical delay from the identical clamped value.
+
+def test_clamped_idle_never_schedules_a_timed_reply_delay():
+    """The exact production runaway: pending=7, threshold=8, avg=311.4375 s,
+    an empty presence window. ``avg - 300`` is a positive constant every
+    evaluation reproduces, so the chat re-armed forever."""
+    snap = _snap(
+        *["a", "b", "c", "d", "e", "f", "g"],
+        threshold=8,
+        trigger_score=80,
+        last_nonself_ts=None,
+        idle_seconds=300.0,
+        recent_average_interval=311.4375,
+        window_count=0,
+        self_count=0,
+        self_ratio=0.0,
+        is_group=True,
+    )
+    decision = _gate().evaluate(snap).decision
+    assert decision.action == "delay"
+    assert decision.delay_seconds is None, "must be event-only, not a re-armed timer"
+
+
+def test_clamped_idle_never_schedules_a_timed_frequency_delay():
+    snap = _snap(
+        *["a", "b"],
+        mode="frequency",
+        threshold=8,
+        last_nonself_ts=None,
+        idle_seconds=300.0,
+        recent_average_interval=311.4375,
+        window_count=0,
+        self_count=0,
+        self_ratio=0.0,
+    )
+    decision = _gate().evaluate(snap).decision
+    assert decision.action == "delay"
+    assert decision.delay_seconds is None
+
+
+def test_measured_idle_still_schedules_a_timed_delay():
+    """The guard is narrow: a real measurement keeps the timed delay."""
+    snap = _snap(
+        "hi",
+        threshold=8,
+        trigger_score=80,
+        last_nonself_ts=250.0,
+        idle_seconds=30.0,
+        recent_average_interval=60.0,
+    )
+    decision = _gate().evaluate(snap).decision
+    assert decision.action == "delay"
+    assert decision.delay_seconds == pytest.approx(30.0)
+
+
+def test_clamped_idle_grants_the_pressure_idle_bonus():
+    """An empty window means the chat HAS gone quiet for at least the window.
+    Comparing the floor against a larger average withheld the +15 bonus from
+    exactly the lull it exists to detect."""
+    snap = _snap(
+        *["a", "b", "c", "d", "e", "f", "g"],
+        threshold=8,
+        last_nonself_ts=None,
+        idle_seconds=300.0,
+        recent_average_interval=311.4375,
+        window_count=0,
+        self_count=0,
+        self_ratio=0.0,
+    )
+    (pressure,) = [c for c in _gate().evaluate(snap).contributions if c.feature == "pressure"]
+    assert "idle_bonus" in pressure.reason
+    assert pressure.value == pytest.approx(53.0)
+
+
+def test_reserved_profile_speaks_up_after_a_lull():
+    """The deployed profile (threshold 8, trigger_score 60): eight unanswered
+    messages plus the idle bonus is enough to join in unprompted."""
+    snap = _snap(
+        *["a", "b", "c", "d", "e", "f", "g", "h"],
+        threshold=8,
+        trigger_score=60,
+        last_nonself_ts=None,
+        idle_seconds=300.0,
+        recent_average_interval=311.4375,
+        window_count=0,
+        self_count=0,
+        self_ratio=0.0,
+    )
+    decision = _gate().evaluate(snap).decision
+    assert decision.action == "trigger"
+    assert decision.score >= 60
+
+
+def test_alias_names_score_as_a_name_mention():
+    """MaiBot's ``bot.alias_names``: a group that has settled on a nickname
+    must not be met with silence because the config says something else."""
+    from pretender.gate import _name_mentioned
+
+    snap = _snapshot(
+        pending_messages=(_msg("bp在吗"),), self_name="bp", self_aliases=("麦麦",)
+    )
+    assert _name_mentioned(snap)
+    snap = _snapshot(
+        pending_messages=(_msg("麦麦在吗"),), self_name="bp", self_aliases=("麦麦",)
+    )
+    assert _name_mentioned(snap)
+    # Without the alias configured, the other name is just text.
+    snap = _snapshot(pending_messages=(_msg("麦麦在吗"),), self_name="bp")
+    assert not _name_mentioned(snap)

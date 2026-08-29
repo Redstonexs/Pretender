@@ -392,7 +392,11 @@ def test_local_production_composition_restart_dedup(monkeypatch: pytest.MonkeyPa
                 "system",
                 "user",
             ]
-            assert reply_body["messages"][1]["content"] == "compose a local reply"
+            # The final user turn carries the current time and the staged
+            # reference, mirroring MaiBot's replyer request.
+            final_turn = reply_body["messages"][1]["content"]
+            assert "当前时间：" in final_turn
+            assert "【回复信息参考】\ncompose a local reply" in final_turn
             assert "tools" not in reply_body
             diagnostics = app_a._llm.request_dump(
                 "planner", {"messages": [{"role": "user", "content": "hidden"}]}
