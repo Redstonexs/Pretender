@@ -88,6 +88,34 @@ cp config.example.toml config.toml
 `SILICONFLOW_API_KEY` 和 `ONEBOT_ACCESS_TOKEN`，使用相应 profile 或适配器
 前先提供所引用的变量。用户 prompt 会覆盖包内同名默认 prompt。
 
+人设分两半，分别喂给两个阶段：`prompts/identity.txt` 是「你是谁、怎么
+说话」，给写回复的 replyer；`prompts/behavior.txt` 是「什么时候开口、
+什么时候闭嘴」，给决定要不要发言的 planner。在 `prompt_dir` 下放同名
+文件即可覆盖，路径由 `[bot] identity_file` / `behavior_file` 指定。
+
+## 在哪些群/私聊说话
+
+`[access]` 决定机器人**允许**在哪里发言，先于 `[gate]`（后者只决定“此刻值不值得回”）。
+被排除的会话永远不会收到回复，**即使被直接 @**；但消息照样会被读取、入库、参与学习——
+机器人还在看，只是不说话。所以拉黑是可逆的：取消后它已经知道这段时间发生了什么。
+
+```toml
+[access.groups]
+enabled = true         # false：任何群都不发言
+mode = "blacklist"     # blacklist：名单里的闭嘴；whitelist：只有名单里的会说话
+ids = ["123456"]       # 群号，或整个 chat key "qq:group:123456"，两种都认
+
+[access.private]
+enabled = true         # false：任何私聊都不回
+mode = "blacklist"
+ids = []
+```
+
+默认是两个空黑名单，也就是全部允许——加上这段配置本身不改变任何行为。
+空的 `whitelist` 表示谁都不允许（这正是白名单的含义），`pretender doctor` 会明确
+报出「the bot will NEVER reply in …」，不会让你对着一个安静的机器人猜原因。
+控制台等既非群聊也非私聊的会话不受这两个名单影响。
+
 ## CLI 与安全
 
 所有命令都支持 `--config PATH`：

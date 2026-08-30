@@ -22,6 +22,7 @@ from pretender.cycle import CycleRunner, PhaseAgent
 from pretender.doctor import Doctor
 from pretender.gate import Gate
 from pretender.media import MediaStore
+from pretender.output.split import typing_time
 from pretender.planner import PlanIntent, PlanResult
 from pretender.replyer import ReplyDraft
 from pretender.types import (
@@ -61,8 +62,9 @@ class FakePlanner:
         self.result = result
         self.calls = 0
 
-    async def plan(self, messages, *, identity, chat_log, reply_style,
+    async def plan(self, messages, *, chat_log, reply_style,
                    focus_chat=None, bot_name="", drift_block="",
+                   behavior_style="",
                    tools=None, temperature=None,
                    max_tokens=None, deadline=None, max_tool_rounds=None):
         self.calls += 1
@@ -328,8 +330,12 @@ def test_split_parts_share_group_order_pacing(tmp_path):
     assert len({r[1] for r in rows}) == 1  # one stable group id
     assert [r[2] for r in rows] == [0, 1, 2]  # ordered by seq
     assert rows[0][3] is None  # part 0 sends immediately
-    assert rows[1][3] == pytest.approx(200.0 + 1.5)
-    assert rows[2][3] == pytest.approx(200.0 + 3.0)
+    # Each later part waits out its own typing time, not a fixed ladder: a
+    # three-character bubble at 0.3s/char lands 0.9s later.
+    assert rows[1][3] == pytest.approx(200.0 + typing_time("第二句"))
+    assert rows[2][3] == pytest.approx(
+        200.0 + typing_time("第二句") + typing_time("第三句")
+    )
 
 
 def test_pipeline_honors_per_reply_switches():

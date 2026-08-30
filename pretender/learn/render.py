@@ -40,6 +40,7 @@ from pretender.types import ChatKey, LearnerBatch, Record
 __all__ = [
     "escape_untrusted",
     "render_batch",
+    "render_attributed_batch",
     "render_records",
     "select_records",
     "source_hash",
@@ -103,6 +104,28 @@ def render_batch(batch: LearnerBatch) -> str:
     parts: list[str] = []
     for i, text in enumerate(batch.texts, start=1):
         parts.append(f"[{i}] {escape_untrusted(text)}")
+    return "\n".join(parts)
+
+
+def render_attributed_batch(batch: LearnerBatch) -> str:
+    """Render one source batch as an opaque-ref list that names the speaker.
+
+    Each message renders as ``[N] <escaped name>: <escaped text>`` — the same
+    opaque refs ``render_batch`` uses, with the display name attached. The
+    impression learner needs it: you cannot form an impression OF someone
+    from an anonymous wall of text. The platform UID is deliberately NOT
+    rendered; the model only ever answers with a ref, and the code resolves
+    that ref to the real identity through ``batch.senders``.
+
+    Falls back to the plain rendering when the batch carries no names (a
+    hand-built batch), so it is always safe to call.
+    """
+    names = batch.sender_names or ("",) * len(batch.texts)
+    parts: list[str] = []
+    for i, (text, name) in enumerate(zip(batch.texts, names, strict=False), start=1):
+        who = escape_untrusted(name).strip()
+        body = escape_untrusted(text)
+        parts.append(f"[{i}] {who}: {body}" if who else f"[{i}] {body}")
     return "\n".join(parts)
 
 

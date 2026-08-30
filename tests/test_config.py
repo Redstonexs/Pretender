@@ -11,6 +11,7 @@ import pytest
 
 from pretender.config import (
     AgentConfig,
+    BotConfig,
     BudgetConfig,
     ChatConfig,
     ContextConfig,
@@ -91,14 +92,14 @@ def test_docker_example_is_the_shipped_live_config(monkeypatch, sample_config_pa
 
     # Neither vision nor embed: opencode.ai/zen has no /embeddings endpoint
     # and no model that actually reads an image.
-    assert set(cfg.llm.profiles) == {"planner", "reply"}
+    assert set(cfg.llm.profiles) == {"planner", "reply", "learn"}
     for name in ("planner", "reply"):
         assert cfg.llm.profile(name).base_url == "https://opencode.ai/zen/v1"
         assert cfg.llm.profile(name).model == "ling-3.0-flash-fin-free"
         assert cfg.llm.profile(name).api_key == "llm-docker-test"
     assert cfg.learn.enabled
     assert set(cfg.learn.profiles) == {
-        "expression", "behavior", "jargon", "summary", "effect",
+        "expression", "behavior", "jargon", "summary", "effect", "impression",
     }
     assert cfg.drift.level == "active"
     assert cfg.media.enabled is False
@@ -1195,3 +1196,22 @@ def test_media_round_trip():
     assert data["media"]["candidate_cap"] == 8
     back = Config.from_dict(data)
     assert back.media == cfg.media
+
+
+def test_output_typing_speed_defaults_and_bounds():
+    """MaiBot's response_post_process.typing_speed range: 0 sends the whole
+    reply at once, 1 is human, 2 is slow."""
+    assert OutputConfig().typing_speed == 1.0
+    assert OutputConfig(typing_speed=0).typing_speed == 0
+    assert OutputConfig(typing_speed=2.0).typing_speed == 2.0
+    for bad in (-0.1, 2.5, float("nan")):
+        with pytest.raises(ConfigError):
+            OutputConfig(typing_speed=bad)
+
+
+def test_bot_persona_files_are_split():
+    """identity_file is the replyer's half of the persona (how it talks);
+    behavior_file is the planner's (when to speak at all)."""
+    cfg = BotConfig()
+    assert cfg.identity_file == "prompts/identity.txt"
+    assert cfg.behavior_file == "prompts/behavior.txt"

@@ -36,14 +36,17 @@ Pretender adds three things MaiBot does not have:
 
 The stage rewrites ``Outgoing.parts``, sets a content-derived ``group_id``
 matching the outbox's scheme, and records per-part pacing in
-``platform_ref["part_pacing"]``. ``seq`` is implicit: the outbox conversion
-assigns part index as ``seq`` when there is more than one part.
+``platform_ref["part_pacing"]`` — derived from how long each bubble would
+take to type (MaiBot's ``calculate_typing_time``), so a two-character reply
+lands quickly and a long one does not. ``seq`` is implicit: the outbox
+conversion assigns part index as ``seq`` when there is more than one part.
 """
 
 from __future__ import annotations
 
 import random
 import re
+from collections.abc import Sequence
 
 from pretender.output.kaomoji import detect_kaomoji_spans
 from pretender.output.pipeline import (
@@ -305,10 +308,66 @@ def split_text(
     return parts
 
 
-def part_delays(n: int) -> list[float]:
-    """Human-ish relative pacing (seconds) per part, cumulative from the base
-    ``send_after_ts``: part 0 sends immediately, each later part a bit later."""
-    return [round(i * 1.5, 2) for i in range(n)]
+#: MaiBot's per-character typing costs (``calculate_typing_time``): a Han
+#: character takes twice as long to type as anything else.
+_CHINESE_CHAR_S = 0.3
+_OTHER_CHAR_S = 0.15
+#: The keystroke that actually sends the message.
+_ENTER_S = 0.3
+#: A sticker/emoji message costs a flat second regardless of its length.
+_EMOJI_S = 1.0
+
+
+def typing_time(
+    text: str, *, typing_speed: float = 1.0, is_emoji: bool = False
+) -> float:
+    """Seconds a person would spend typing ``text``.
+
+    A port of MaiBot's ``calculate_typing_time``. ``typing_speed`` is its
+    multiplier (0 disables the wait entirely, 1 is human, 2 is slow).
+
+    The lone-Han-character case is MaiBot's: a bubble that is exactly one
+    Han character reads as a considered reaction rather than a fast one, so
+    it costs triple plus the enter key. Note that MaiBot adds ``_ENTER_S``
+    *only* in that branch — its ``return total_time  # 加上回车时间`` comment
+    on the normal path does not match its code. The behaviour is ported as
+    written, not as commented, so the pacing matches the reference bot.
+
+    One deliberate deviation: MaiBot returns from the lone-character branch
+    BEFORE it reads ``typing_speed``, so ``typing_speed = 0`` still waits
+    1.2s for a one-character bubble. A knob documented as "send it all at
+    once" that quietly does not is a bug, so the zero check comes first here.
+    """
+    if typing_speed <= 0:
+        return 0.0
+    chinese = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    if chinese == 1 and len(text.strip()) == 1:
+        return _CHINESE_CHAR_S * 3 + _ENTER_S
+    if is_emoji:
+        return _EMOJI_S * typing_speed
+    total = sum(
+        _CHINESE_CHAR_S if "\u4e00" <= ch <= "\u9fff" else _OTHER_CHAR_S
+        for ch in text
+    )
+    return total * typing_speed
+
+
+def part_delays(parts: Sequence[str], typing_speed: float = 1.0) -> list[float]:
+    """Relative pacing (seconds) per part, cumulative from the base
+    ``send_after_ts``.
+
+    Part 0 sends immediately — it was already "typed" while the model was
+    thinking. Every later part arrives once the person would have finished
+    typing it, so a two-character bubble follows quickly and a long one
+    takes its time. A flat ladder is the tell this removes: real bubbles do
+    not arrive on a metronome.
+    """
+    delays = [0.0]
+    elapsed = 0.0
+    for part in parts[1:]:
+        elapsed += typing_time(part, typing_speed=typing_speed)
+        delays.append(round(elapsed, 2))
+    return delays
 
 
 class SplitStage:
@@ -318,8 +377,9 @@ class SplitStage:
     name = "split"
     order = 20
 
-    def __init__(self, max_split: int = 3) -> None:
+    def __init__(self, max_split: int = 3, typing_speed: float = 1.0) -> None:
         self.max_split = max_split
+        self.typing_speed = typing_speed
 
     def apply(self, out: Outgoing) -> Outgoing:
         if out.parts is not None:
@@ -345,5 +405,5 @@ class SplitStage:
             return out
         out.parts = parts
         out.group_id = stable_group_id(parts)
-        out.platform_ref["part_pacing"] = part_delays(len(parts))
+        out.platform_ref["part_pacing"] = part_delays(parts, self.typing_speed)
         return out

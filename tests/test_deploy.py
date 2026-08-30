@@ -1398,8 +1398,44 @@ def test_generated_config_enables_the_learners():
 
     text = render_config(_zen(), Features(), "data/p.db")
     assert "[learn]\nenabled = true" in text
-    for learner in ("expression", "behavior", "jargon", "summary", "effect"):
+    for learner in (
+        "expression", "behavior", "jargon", "summary", "effect", "impression",
+    ):
         assert f"[learn.profiles.{learner}]" in text
+
+
+def test_generated_config_gives_the_learners_a_provider_profile():
+    """[learn] without [llm.profiles.learn] is learning switched off: every
+    run fails with "no LLM profile named 'learn'" and no record is ever
+    written. The first deployment shipped exactly that."""
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "[llm.profiles.learn]" in text
+    # Nothing to call when learning is off, so nothing is written.
+    off = render_config(_zen(), Features(learning=False), "data/p.db")
+    assert "[llm.profiles.learn]" not in off
+
+
+def test_generated_config_ships_the_access_lists_permissive():
+    """The wizard writes the lists so an operator can find them, with the
+    empty-blacklist default that changes nothing until ids are added."""
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "[access.groups]" in text
+    assert "[access.private]" in text
+    assert text.count('mode = "blacklist"') == 2
+    assert text.count("ids = []") == 2
+
+
+def test_generated_config_paces_the_bubbles():
+    """A constant delay ladder is a tell: real bubbles arrive when the person
+    finished typing them, so the wait scales with the bubble."""
+    from scripts.deploy import Features, render_config
+
+    text = render_config(_zen(), Features(), "data/p.db")
+    assert "typing_speed = 1.0" in text
 
 
 def test_generated_config_carries_drift():
@@ -1470,8 +1506,8 @@ def test_generated_config_loads(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     cfg = load_config(path)
-    assert sorted(cfg.llm.profiles) == ["planner", "reply"]
-    assert cfg.learn.enabled and len(cfg.learn.profiles) == 5
+    assert sorted(cfg.llm.profiles) == ["learn", "planner", "reply"]
+    assert cfg.learn.enabled and len(cfg.learn.profiles) == 6
     assert cfg.drift.level == "active"
     # No vision on this provider, so media degrades off rather than harvesting
     # stickers it can never describe.

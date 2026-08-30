@@ -13,7 +13,7 @@ import random
 import pytest
 
 from pretender.output import SplitStage, split_text
-from pretender.output.split import _SEPARATORS
+from pretender.output.split import _SEPARATORS, part_delays, typing_time
 from pretender.types import ChatKey, Outgoing, Segment
 
 
@@ -231,3 +231,76 @@ def test_segmented_outgoing_is_not_text_split():
     out = _out("第一句。第二句。", segments=[Segment(kind="text", data={"text": "x"})])
     SplitStage(max_split=3).apply(out)
     assert out.parts is None
+
+
+# ── typing pacing (MaiBot's calculate_typing_time) ───────────────────────────
+#
+# A constant delay ladder is the tell these replace: real bubbles do not
+# arrive on a metronome, they arrive when the person finished typing them.
+
+
+def test_typing_time_uses_maibot_per_character_costs():
+    # 0.3s per Han character, 0.15s per anything else.
+    assert typing_time("行啊") == pytest.approx(0.6)
+    assert typing_time("ok") == pytest.approx(0.3)
+    assert typing_time("好ok") == pytest.approx(0.3 + 0.3)
+
+
+def test_a_lone_han_character_costs_triple_plus_the_enter_key():
+    # MaiBot's special case: a one-character reply reads as considered, not
+    # instant, so it waits 3x plus the enter keystroke.
+    assert typing_time("好") == pytest.approx(0.3 * 3 + 0.3)
+    assert typing_time(" 好 ") == pytest.approx(0.3 * 3 + 0.3)
+    # Two characters is ordinary typing again.
+    assert typing_time("好的") == pytest.approx(0.6)
+
+
+def test_typing_speed_scales_and_zero_disables_the_wait():
+    assert typing_time("行啊", typing_speed=2.0) == pytest.approx(1.2)
+    assert typing_time("行啊", typing_speed=0.5) == pytest.approx(0.3)
+    assert typing_time("行啊", typing_speed=0) == 0.0
+    assert typing_time("好", typing_speed=0) == 0.0
+
+
+def test_an_emoji_message_costs_a_flat_second():
+    assert typing_time("whatever", is_emoji=True) == pytest.approx(1.0)
+
+
+def test_part_delays_are_cumulative_and_scale_with_length():
+    parts = ["行啊", "走吧走吧", "外面太热了"]
+    delays = part_delays(parts)
+    # Part 0 sends immediately: it was typed while the model was thinking.
+    assert delays[0] == 0.0
+    # Each later part waits out its OWN typing time, cumulatively.
+    assert delays[1] == pytest.approx(typing_time("走吧走吧"), abs=0.01)
+    assert delays[2] == pytest.approx(
+        typing_time("走吧走吧") + typing_time("外面太热了"), abs=0.01
+    )
+    assert delays == sorted(delays)
+
+
+def test_a_long_bubble_waits_longer_than_a_short_one():
+    short = part_delays(["嗯", "行啊"])
+    long_ = part_delays(["嗯", "外面太热了我们还是别去了吧"])
+    assert long_[1] > short[1]
+
+
+def test_part_delays_of_a_single_part_is_just_zero():
+    assert part_delays(["只有一条"]) == [0.0]
+    assert part_delays([]) == [0.0]
+
+
+def test_stage_records_content_derived_pacing():
+    out = _out("今天天气不错啊，我刚出去走了走，风挺舒服的。", idem_key="k")
+    SplitStage(max_split=3, typing_speed=1.0).apply(out)
+    if out.parts:
+        pacing = out.platform_ref["part_pacing"]
+        assert pacing == part_delays(out.parts, 1.0)
+        assert pacing[0] == 0.0
+
+
+def test_stage_typing_speed_zero_sends_every_part_at_once():
+    out = _out("今天天气不错啊，我刚出去走了走，风挺舒服的。", idem_key="k")
+    SplitStage(max_split=3, typing_speed=0).apply(out)
+    if out.parts:
+        assert out.platform_ref["part_pacing"] == [0.0] * len(out.parts)

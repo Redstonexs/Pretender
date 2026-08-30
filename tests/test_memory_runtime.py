@@ -116,8 +116,9 @@ class FakeLLM:
 
 
 class _WaitPlanner:
-    async def plan(self, messages, *, identity, chat_log, reply_style,
+    async def plan(self, messages, *, chat_log, reply_style,
                    focus_chat=None, bot_name="", drift_block="",
+                   behavior_style="",
                    tools=None, temperature=None,
                    max_tokens=None, deadline=None, max_tool_rounds=None):
         return PlanResult(intent=PlanIntent.WAIT, wait_seconds=30.0,

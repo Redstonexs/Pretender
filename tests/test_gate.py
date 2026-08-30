@@ -1282,3 +1282,48 @@ def test_alias_names_score_as_a_name_mention():
     # Without the alias configured, the other name is just text.
     snap = _snapshot(pending_messages=(_msg("麦麦在吗"),), self_name="bp")
     assert not _name_mentioned(snap)
+
+
+# ── [access] mute: the bot watches but never speaks ─────────────────────────
+
+
+def test_a_muted_chat_skips():
+    trace = Gate().evaluate(_snapshot(muted=True))
+    assert trace.decision.action == "skip"
+    assert trace.decision.reason == Reason.MUTED
+
+
+def test_a_muted_chat_stays_silent_through_a_direct_at():
+    """Deliberately above the hard trigger. An operator who blacklists a
+    group means it, and a mute a direct @ can override is not a control
+    worth having."""
+    trace = Gate().evaluate(_snapshot(muted=True, has_direct_at=True))
+    assert trace.decision.action == "skip"
+    assert trace.decision.reason == Reason.MUTED
+
+    trace = Gate().evaluate(_snapshot(muted=True, has_quote_to_self=True))
+    assert trace.decision.action == "skip"
+    assert trace.decision.reason == Reason.MUTED
+
+
+def test_the_same_snapshot_unmuted_still_triggers():
+    """The mute is the only thing changing — without it this is a trigger."""
+    trace = Gate().evaluate(_snapshot(has_direct_at=True))
+    assert trace.decision.action == "trigger"
+    assert trace.decision.reason == Reason.TRIGGER
+
+
+def test_the_mute_is_recorded_in_the_trace():
+    """A silent bot must be explainable from its own trace."""
+    trace = Gate().evaluate(_snapshot(muted=True))
+    assert trace.snapshot_facts["muted"] is True
+    assert Gate().evaluate(_snapshot()).snapshot_facts["muted"] is False
+
+
+def test_features_still_run_for_a_muted_chat():
+    """The decision short-circuits; the trace does not. A muted chat still
+    records what it would have scored, so turning the mute off is a
+    predictable change rather than a surprise."""
+    trace = Gate().evaluate(_snapshot(muted=True, has_direct_at=True))
+    assert trace.contributions
+    assert all(c.error is None for c in trace.contributions)

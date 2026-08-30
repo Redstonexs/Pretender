@@ -342,6 +342,10 @@ class GateSnapshot:
     self_name: str | None = None
     #: Other names this bot answers to (MaiBot's ``bot.alias_names``).
     self_aliases: tuple[str, ...] = ()
+    #: The chat is excluded by the ``[access]`` lists: the bot watches but
+    #: never speaks here. Evaluated BEFORE the hard @-trigger — a mute a
+    #: direct mention can override is not a control anyone would trust.
+    muted: bool = False
     has_direct_at: bool = False
     has_quote_to_self: bool = False
     has_other_assistant: bool = False
@@ -445,6 +449,7 @@ class Reason:
     MODE = "mode"  # mode selection (frequency mode)
     DELAY = "delay"  # timed or event-only delay
     SKIP = "skip"  # no action this cycle
+    MUTED = "muted"  # the [access] lists exclude this chat
 
 
 @dataclass(frozen=True)
@@ -1280,7 +1285,8 @@ class LearnerBatch:
     watermark, capped to a recent tail.
 
     ``texts`` are the source message texts in row order (``is_self``
-    excluded for a ``nonself`` policy); ``source_hash`` is the
+    excluded for a ``nonself`` policy), with ``senders``/``sender_names``
+    positionally aligned to them; ``source_hash`` is the
     deterministic hash of those texts (computed by the repository, so the
     learner never invents one); ``observed_watermark`` is the durable
     watermark observed when the batch was read — the exact snapshot the CAS
@@ -1298,6 +1304,12 @@ class LearnerBatch:
     # defaults keep hand-built batches from older callers source-compatible.
     policy: str = "nonself"
     source_ids: tuple[MessageRowId, ...] = ()
+    # Who wrote each source text, positionally aligned with ``texts``. Only
+    # the impression learner reads these; ``source_hash`` is computed from
+    # ``texts`` ALONE, so adding them leaves every existing watermark and
+    # CAS fence byte-identical. Empty for hand-built batches.
+    senders: tuple[SenderId, ...] = ()
+    sender_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.first_msg_id > self.last_msg_id:
@@ -1308,6 +1320,10 @@ class LearnerBatch:
             raise ValueError("policy must be 'nonself' or 'all'")
         if self.source_ids and len(self.source_ids) != len(self.texts):
             raise ValueError("source_ids must match texts")
+        if self.senders and len(self.senders) != len(self.texts):
+            raise ValueError("senders must match texts")
+        if self.sender_names and len(self.sender_names) != len(self.texts):
+            raise ValueError("sender_names must match texts")
 
 
 @dataclass(frozen=True)

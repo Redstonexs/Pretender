@@ -13,6 +13,8 @@ import dataclasses
 import pytest
 
 from pretender.config import (
+    AccessConfig,
+    AccessListConfig,
     BotConfig,
     ChatOverride,
     Config,
@@ -337,7 +339,10 @@ def test_prompts_probe_ok_with_package_defaults():
     report = run(_doctor(prompts=PromptStore()).run())
     p = probe(report, "prompts")
     assert p.status == "ok"
-    assert p.data["assets"] == ["identity.txt", "planner.txt", "replyer.txt", "planner_focus.txt"]
+    assert p.data["assets"] == [
+        "identity.txt", "behavior.txt", "planner.txt", "replyer.txt",
+        "planner_focus.txt",
+    ]
 
 
 def test_prompts_probe_fails_on_missing_asset():
@@ -655,7 +660,7 @@ def test_run_collects_all_probes_even_when_one_raises():
             raise RuntimeError("boom")
 
     report = run(_doctor(llm=ExplodingLLM(), embedder=ExplodingLLM()).run())
-    assert len(report.probes) == 13
+    assert len(report.probes) == 14
     assert [p.name for p in report.probes] == list(Doctor.PROBES)
     assert probe(report, "llm_chat").status == "fail"
     assert probe(report, "llm_tools").status == "fail"
@@ -769,7 +774,7 @@ def test_report_render_is_deterministic_and_structured():
     assert "[SKIP] learner" in rendered
     # The media catalog probe skips when the catalog is disabled.
     assert "[SKIP] media_catalog" in rendered
-    assert "summary: 13 probes: 8 ok, 5 skip" in rendered
+    assert "summary: 14 probes: 9 ok, 5 skip" in rendered
     assert report.render() == rendered  # deterministic
 
 
@@ -805,7 +810,7 @@ def test_built_seams_are_closed(tmp_path):
     cfg = Config(storage=StorageConfig(db_path=str(tmp_path / "doctor.db")))
     doctor = Doctor(cfg, adapter=FakeAdapter())
     report = run(doctor.run())
-    assert len(report.probes) == 13
+    assert len(report.probes) == 14
     assert report.status == "ok"
 
     async def reopen():
@@ -1250,15 +1255,46 @@ def test_semantic_probe_skips_blocked_embed_profile(tmp_path):
 
 # ── learner probe (Phase 6 P6.4): disabled / blocked / missing-prompt ────────
 
-def _learn_cfg(enabled: bool = True, profiles: dict | None = None) -> Config:
+def _learn_cfg(
+    enabled: bool = True,
+    profiles: dict | None = None,
+    *,
+    llm_profile: bool = True,
+) -> Config:
+    """``llm_profile`` adds the ``learn`` PROVIDER profile every learner run
+    calls — distinct from the per-learner ``[learn.profiles.*]`` entries."""
     cfg = _cfg()
+    llm = cfg.llm
+    if llm_profile:
+        llm = LLMConfig(profiles={
+            **cfg.llm.profiles,
+            "learn": LLMProfile(
+                base_url="https://api.example.com/v1",
+                api_key="sk-learn",
+                model="m",
+            ),
+        })
     return dataclasses.replace(
         cfg,
+        llm=llm,
         learn=LearnConfig(
             enabled=enabled,
             profiles={k: LearnProfile(**v) for k, v in (profiles or {}).items()},
         ),
     )
+
+
+def test_learner_probe_fails_without_the_learn_llm_profile():
+    """Every learner run calls the one ``learn`` provider profile. Without it
+    each run dies on "no LLM profile named 'learn'", the watermark never
+    advances, and nothing is learned — while [learn] looks switched on. The
+    doctor used to report "worker ready" through exactly that."""
+    doctor = _doctor(
+        cfg=_learn_cfg(profiles={"expression": {}}, llm_profile=False)
+    )
+    p = probe(run(doctor.run()), "learner")
+    assert p.status == "fail"
+    assert "[llm.profiles.learn]" in p.detail
 
 
 def test_learner_probe_disabled():
@@ -1480,3 +1516,64 @@ def test_chat_controls_probe_ok_with_real_repo(tmp_path):
     p = probe(report, "chat_controls")
     assert p.status == "ok"
     assert "surface ready" in p.detail
+
+
+# ── access probe: where the bot may speak ───────────────────────────────────
+
+
+def _access_cfg(**kw) -> Config:
+    return dataclasses.replace(_cfg(), access=AccessConfig(**kw))
+
+
+def test_access_probe_reports_the_permissive_default():
+    p = probe(run(_doctor().run()), "access")
+    assert p.status == "ok"
+    assert "groups: all allowed" in p.detail
+    assert "private: all allowed" in p.detail
+    assert p.data["silent"] == []
+
+
+def test_access_probe_says_so_when_the_bot_can_never_reply():
+    """An empty whitelist looks like an oversight and behaves like a mute.
+    Silence that the operator cannot explain is the failure mode here, so
+    the probe names it rather than leaving it to be discovered."""
+    p = probe(
+        run(_doctor(cfg=_access_cfg(groups=AccessListConfig(mode="whitelist"))).run()),
+        "access",
+    )
+    assert "empty whitelist" in p.detail
+    assert "NEVER reply in groups" in p.detail
+    assert p.data["silent"] == ["groups"]
+
+
+def test_access_probe_reports_a_disabled_category():
+    p = probe(
+        run(_doctor(cfg=_access_cfg(private=AccessListConfig(enabled=False))).run()),
+        "access",
+    )
+    assert "private: disabled" in p.detail
+    assert p.data["silent"] == ["private"]
+
+
+def test_access_probe_never_fails_on_policy():
+    """Silencing the bot everywhere is a legitimate choice, not a broken
+    install — the probe informs, it does not veto."""
+    cfg = _access_cfg(
+        groups=AccessListConfig(enabled=False),
+        private=AccessListConfig(enabled=False),
+    )
+    p = probe(run(_doctor(cfg=cfg).run()), "access")
+    assert p.status == "ok"
+    assert p.data["silent"] == ["groups", "private"]
+
+
+def test_access_probe_counts_the_lists():
+    cfg = _access_cfg(
+        groups=AccessListConfig(mode="whitelist", ids=("1", "2")),
+        private=AccessListConfig(ids=("9",)),
+    )
+    p = probe(run(_doctor(cfg=cfg).run()), "access")
+    assert "groups: whitelist of 2" in p.detail
+    assert "private: blacklist of 1" in p.detail
+    assert p.data["groups"]["count"] == 2
+    assert p.data["private"]["mode"] == "blacklist"

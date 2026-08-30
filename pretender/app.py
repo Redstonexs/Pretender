@@ -60,6 +60,7 @@ from dataclasses import is_dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Sequence, cast
 
+from pretender.access import is_muted
 from pretender.adapters.console import ConsoleAdapter
 from pretender.adapters.onebot import OneBotAdapter
 from pretender.budget import BLOCKED, BudgetManager, LearnerBudget
@@ -76,6 +77,7 @@ from pretender.errors import ConfigError, PromptError
 from pretender.gate import Gate
 from pretender.ingest import DeliveryKeyFn, Ingest
 from pretender.learn import (
+    IMPRESSION_MAX,
     SPECS,
     VALIDATORS,
     LearnerPipeline,
@@ -115,11 +117,13 @@ from pretender.types import (
     Message,
     MessageRowId,
     OutboxItem,
+    PersonProfile,
     PlatformId,
     Record,
     RecordHit,
     RuntimeMode,
     SelfId,
+    SenderId,
     SettlementNotice,
     VectorRow,
     WakeKind,
@@ -371,7 +375,8 @@ def _build_learner_specs(
     """The enabled learner specs from the config's ``learn.profiles``.
 
     Each profile names a known spec (expression/behavior/jargon/summary/
-    effect) whose prompt file must load through the PromptStore; a profile
+    effect/impression) whose prompt file must load through the PromptStore;
+    a profile
     that names an unknown learner or a missing prompt file is SKIPPED (the
     doctor reports it truthfully). Profile fields override the spec
     defaults. Returns an empty dict when nothing is valid — the worker then
@@ -1194,9 +1199,14 @@ class LearnerScheduler:
         *,
         scan_interval_s: float = 60.0,
         budget: LearnerBudget | None = None,
+        person_service: Any = None,
     ) -> None:
         self._repo = repo
         self._pipeline = pipeline
+        # The sink the impression learner projects onto. None disables the
+        # projection: the records are still committed, they just do not
+        # reach ``persons``.
+        self._person_service = person_service
         self._specs = dict(specs)
         self._clock = clock
         self._scan_interval_s = float(scan_interval_s)
@@ -1386,6 +1396,8 @@ class LearnerScheduler:
             spec = self._specs[learner]
             if learner == "effect":
                 await self._run_effect(chat_key, spec)
+            elif learner == "impression":
+                await self._run_impression(chat_key, spec)
             else:
                 await self._run_pipeline(chat_key, spec)
         except asyncio.CancelledError:
@@ -1409,6 +1421,77 @@ class LearnerScheduler:
         the run and the next scheduled run picks the source up again)."""
         result = await self._pipeline.run(chat_key, spec)
         self._record_notice(result)
+
+    async def _run_impression(self, chat_key: ChatKey, spec: LearnerSpec) -> None:
+        """The impression learner: what the bot thinks of the people here.
+
+        The committed records are the durable log (they carry the watermark
+        and the CAS discipline); ``persons.impression`` is a projection of
+        them, applied after the commit rather than inside it. A projection
+        that fails leaves the records intact and is re-derived on the next
+        run, so the two never diverge permanently.
+        """
+        result = await self._pipeline.run(chat_key, spec)
+        self._record_notice(result)
+        if result.outcome == "success" and result.records_added >= 1:
+            await self._project_impressions(chat_key, result.run_id, result.watermark)
+
+    async def _project_impressions(
+        self,
+        chat_key: ChatKey,
+        run_id: int | None,
+        watermark: MessageRowId | None,
+    ) -> None:
+        """Write one run's impressions onto the people they are about.
+
+        Only people already observed in this chat are updated — the person
+        row is created by ingest's ``observe``, never here, so a model
+        response can never conjure someone who has not spoken. A stale CAS
+        or an unknown person is a no-op, not an error.
+        """
+        if self._person_service is None or run_id is None or watermark is None:
+            return
+        try:
+            records = await self._repo.list_records_for_run(
+                chat_key, "impression", run_id, limit=IMPRESSION_MAX
+            )
+        except Exception:
+            return
+        for record in records:
+            payload = record.payload or {}
+            uid = payload.get("platform_uid")
+            impression = payload.get("impression")
+            if not isinstance(uid, str) or not uid.strip():
+                continue
+            if not isinstance(impression, str) or not impression.strip():
+                continue
+            platform_uid = SenderId(uid)
+            try:
+                existing = await self._person_service.get_profile(
+                    chat_key, platform_uid
+                )
+                if existing is None:
+                    continue
+                await self._person_service.apply_profile(
+                    chat_key,
+                    platform_uid,
+                    update=PersonProfile(
+                        chat_key=chat_key,
+                        platform_uid=platform_uid,
+                        names=existing.names,
+                        profile=existing.profile,
+                        impression=impression.strip(),
+                    ),
+                    through_msg_id=watermark,
+                    expected_through_msg_id=existing.profile_through_msg_id,
+                    now=self._clock.now(),
+                )
+            except Exception:
+                log.warning(
+                    "impression projection failed for %s (contained)",
+                    chat_key,
+                    exc_info=True,
+                )
 
     async def _run_effect(self, chat_key: ChatKey, spec: LearnerSpec) -> None:
         """The effect learner: runs ONLY when pending references exist,
@@ -1848,7 +1931,13 @@ class App:
         media_store = getattr(adapter, "_media", None) or MediaStore()
         if cfg.media.enabled:
             adapter = MediaResolvingAdapter(adapter, media_store, repo=repo)
-        outbox = OutboxDriver(repo, adapter, clock=clock)
+        outbox = OutboxDriver(
+            repo,
+            adapter,
+            clock=clock,
+            # Rows queued before a chat was muted must not still go out.
+            muted=lambda chat_key: is_muted(cfg.access, chat_key),
+        )
         # Trusted delivery-key resolver: wired only when the adapter
         # exposes it (the console adapter does not; OneBot does). Missing/
         # untrusted keys stay ``unproven``.
@@ -2063,6 +2152,9 @@ class App:
                     clock,
                     scan_interval_s=float(cfg.learn.cadence_s),
                     budget=learner_budget,
+                    # The impression learner projects onto persons through
+                    # the same service that observes aliases at ingest.
+                    person_service=person_service,
                 )
                 adaptive = AdaptiveContextService(
                     repo,

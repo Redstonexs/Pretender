@@ -72,6 +72,7 @@ __all__ = ["Doctor", "DoctorReport", "ProbeResult"]
 # Fixed probe order — the report is deterministic by construction.
 _PROBE_ORDER = (
     "config",
+    "access",
     "prompts",
     "database",
     "adapter",
@@ -87,20 +88,28 @@ _PROBE_ORDER = (
 )
 
 # The prompt assets the bot's personality/planner/replyer lanes require.
-_REQUIRED_PROMPTS = ("identity.txt", "planner.txt", "replyer.txt", "planner_focus.txt")
+_REQUIRED_PROMPTS = (
+    "identity.txt",
+    "behavior.txt",
+    "planner.txt",
+    "replyer.txt",
+    "planner_focus.txt",
+)
 
 # The standard variable set each templated prompt must render with. A prompt
 # that references anything else is a broken asset, not a doctor bug.
 _PROMPT_VARIABLES: dict[str, dict[str, str]] = {
+    # The planner gets ``behavior_style`` (when to speak) where the replyer
+    # gets ``identity`` (how to speak) — MaiBot's PersonalityConfig split.
     "planner.txt": {
-        "identity": "probe",
+        "behavior_style": "probe",
         "chat_log": "",
         "reply_style": "probe",
         "bot_name": "probe",
         "drift_block": "",
     },
     "planner_focus.txt": {
-        "identity": "probe",
+        "behavior_style": "probe",
         "chat_log": "",
         "reply_style": "probe",
         "focus_chat": "probe",
@@ -340,6 +349,56 @@ class Doctor:
                 "profiles": profiles,
                 "chats": len(cfg.chats),
                 "plugins": plugin_facts,
+            },
+        )
+
+    async def _probe_access(self) -> ProbeResult:
+        """Where the bot is allowed to speak (``[access]``).
+
+        Never fails on policy — an operator is allowed to silence the bot
+        everywhere. It reports the effective rule for each category, and
+        says so plainly when the configuration means "reply nowhere", since
+        an empty whitelist looks like an oversight and behaves like a mute.
+        """
+        access = self._cfg.access
+        lines: list[str] = []
+        silent: list[str] = []
+        for label, access_list in (
+            ("groups", access.groups),
+            ("private", access.private),
+        ):
+            if not access_list.enabled:
+                lines.append(f"{label}: disabled (never replies)")
+                silent.append(label)
+                continue
+            count = len(access_list.ids)
+            if access_list.mode == "whitelist":
+                if count == 0:
+                    lines.append(f"{label}: empty whitelist (allows nothing)")
+                    silent.append(label)
+                else:
+                    lines.append(f"{label}: whitelist of {count}")
+            elif count:
+                lines.append(f"{label}: blacklist of {count}")
+            else:
+                lines.append(f"{label}: all allowed")
+        detail = "; ".join(lines)
+        if silent:
+            detail += f" — the bot will NEVER reply in {' or '.join(silent)}"
+        return ProbeResult(
+            "access", "ok", detail=detail,
+            data={
+                "groups": {
+                    "enabled": access.groups.enabled,
+                    "mode": access.groups.mode,
+                    "count": len(access.groups.ids),
+                },
+                "private": {
+                    "enabled": access.private.enabled,
+                    "mode": access.private.mode,
+                    "count": len(access.private.ids),
+                },
+                "silent": silent,
             },
         )
 
@@ -908,6 +967,11 @@ class Doctor:
         - A profile naming an unknown learner -> ``fail`` (blocked).
         - A profile whose spec's prompt file does not load -> ``fail``
           (missing-prompt).
+        - No ``[llm.profiles.learn]`` to call -> ``fail``. Every learner run
+          goes through that ONE provider profile; without it each run dies
+          on ``no LLM profile named 'learn'``, the watermark never advances,
+          and the whole adaptive layer silently produces nothing while the
+          config looks enabled.
         - Enabled with at least one valid profile -> ``ok`` (the bounded
           worker would start in LIVE mode).
         """
@@ -920,9 +984,15 @@ class Doctor:
                 "learner", "fail",
                 detail="learn enabled but no profiles configured (blocked)",
             )
-        from pretender.learn import SPECS
+        from pretender.learn import LEARN_PROFILE, SPECS
 
         problems: list[str] = []
+        if LEARN_PROFILE not in cfg.llm.profiles:
+            problems.append(
+                f"no [llm.profiles.{LEARN_PROFILE}] configured"
+                f" (have: {sorted(cfg.llm.profiles)}) — every learner run"
+                " fails and no records are ever written"
+            )
         valid = 0
         for name in sorted(profiles):
             spec = SPECS.get(name)

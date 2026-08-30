@@ -37,6 +37,7 @@ concrete implementations. Timestamps come from the injected clock
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from typing import Any
 
 from pretender.clock import RealClock
@@ -52,10 +53,23 @@ class OutboxDriver:
     """Turns Outgoings into durable rows (via finish_cycle) and drives
     at-most-once sends."""
 
-    def __init__(self, repo: Repository, adapter: Adapter, clock: Any = None) -> None:
+    def __init__(
+        self,
+        repo: Repository,
+        adapter: Adapter,
+        clock: Any = None,
+        *,
+        muted: Callable[[ChatKey], bool] | None = None,
+    ) -> None:
         self._repo = repo
         self._adapter = adapter
         self._clock = clock if clock is not None else RealClock()
+        # The ``[access]`` verdict. The gate already refuses to plan a reply
+        # for a muted chat, but rows queued BEFORE the mute took effect are
+        # still sitting there — and with content-derived pacing a reply's
+        # later bubbles are scheduled seconds into the future, so "mute that
+        # group, restart" would otherwise still deliver parts 2 and 3.
+        self._muted = muted
 
     # ── pure conversion (rows are created only by finish_cycle) ─────────────
 
@@ -117,7 +131,15 @@ class OutboxDriver:
         Each item: CAS to in_flight (committed before the adapter runs),
         ``adapter.send``, then mark sent + self echo. A failed send leaves
         the item in_flight and is never retried by this or any later pump.
+
+        A chat the ``[access]`` lists mute sends nothing at all — its rows
+        stay pending rather than being destroyed, so unlisting the chat is
+        as reversible as listing it was.
         """
+        if self._muted is not None and self._muted(chat_key):
+            # Left pending, never cancelled: un-listing the chat is meant to
+            # be reversible, and silently destroying queued rows is not.
+            return 0
         ts: float = self._clock.now() if now is None else now
         items = await self._repo.list_ready_outbox(chat_key, now=ts, limit=limit)
         sent = 0

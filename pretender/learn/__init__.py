@@ -7,11 +7,12 @@ Public surface for the learner lane:
   optional budget reservation → exactly one provider completion with a 45s
   deadline → strict JSON parsing → strict schema validation → all-or-nothing
   CAS commit).
-- The five frozen specs (``EXPRESSION_SPEC`` … ``EFFECT_SPEC``), their
+- The six frozen specs (``EXPRESSION_SPEC`` … ``IMPRESSION_SPEC``), their
   ``SPECS`` registry and strict ``VALIDATORS``.
 - ``derive_effect_delta`` — the code-owned bounded delta (the model only
   returns categorization/confidence).
 - Rendering/identity helpers: ``render_batch`` (opaque per-batch refs),
+  ``render_attributed_batch`` (the same refs, naming the speaker),
   ``render_records`` / ``select_records`` (escaped reference surface),
   ``escape_untrusted``, ``source_hash`` / ``canonical_content``.
 - ``parse_json_response`` — strict raw-JSON / one-outer-fence parsing.
@@ -38,6 +39,7 @@ from pretender.learn.pipeline import (
 from pretender.learn.render import (
     canonical_content,
     escape_untrusted,
+    render_attributed_batch,
     render_batch,
     render_records,
     select_records,
@@ -51,6 +53,9 @@ from pretender.learn.specs import (
     EXPRESSION_FIELD_MAX,
     EXPRESSION_MAX,
     EXPRESSION_SPEC,
+    IMPRESSION_FIELD_MAX,
+    IMPRESSION_MAX,
+    IMPRESSION_SPEC,
     JARGON_MAX,
     JARGON_SPEC,
     LEARNING_TYPES,
@@ -72,6 +77,9 @@ __all__ = [
     "DEFAULT_LEARN_LEASE_S",
     # the five specs + validators
     "EXPRESSION_SPEC",
+    "IMPRESSION_FIELD_MAX",
+    "IMPRESSION_MAX",
+    "IMPRESSION_SPEC",
     "BEHAVIOR_SPEC",
     "JARGON_SPEC",
     "SUMMARY_SPEC",
@@ -97,6 +105,7 @@ __all__ = [
     "LearnerValidationError",
     # rendering / identity helpers
     "escape_untrusted",
+    "render_attributed_batch",
     "render_batch",
     "render_records",
     "select_records",

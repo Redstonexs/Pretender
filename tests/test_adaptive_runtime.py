@@ -23,13 +23,17 @@ from pretender.cycle import AdaptiveContextService
 from pretender.learn import (
     EFFECT_SPEC,
     EXPRESSION_SPEC,
+    IMPRESSION_SPEC,
     VALIDATORS,
     LearnerPipeline,
     LearnerRunResult,
 )
+from pretender.person import PersonService
 from pretender.prompts import PromptStore
 from pretender.types import (
     ChatKey,
+    PersonProfile,
+    SenderId,
     LearnerDraft,
     LearnerGrant,
     LearnerRunRequest,
@@ -83,9 +87,11 @@ async def commit_records(repo, learner: str, records: list[Record], *, chat_key:
             chat_key=chat_key, learner=learner, batch=batch,
             records=tuple(records),
             expected_through_msg_id=batch.observed_watermark,
+            run_id=grant.run_id,
         ),
         now=now,
     )
+    return grant.run_id
 
 
 class FakePipeline:
@@ -413,6 +419,102 @@ def test_adaptive_context_jargon_scoped_to_current_text(tmp_path):
     assert ctx2.jargon == ()
 
 
+def test_expression_selection_follows_the_current_topic(tmp_path):
+    """The reply style tracks what is being said.
+
+    Selecting by weight alone hands the replyer the same expressions in
+    every conversation forever, which is how a bot sounds. A person's
+    register moves with the topic, so the slot is scoped to the live text.
+    """
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        await commit_records(repo, "expression", [
+            make_record("expression", {
+                "situation": "打游戏输了", "style": "自嘲", "source_id": 1,
+            }),
+            make_record("expression", {
+                "situation": "聊吃饭", "style": "馋", "source_id": 2,
+            }),
+        ])
+        service = AdaptiveContextService(repo, now=lambda: 100.0)
+        gaming = await service.build(
+            CK, pending_text="又打游戏输了", recent_text="", mode=RuntimeMode.LIVE
+        )
+        food = await service.build(
+            CK, pending_text="今天聊吃饭吧", recent_text="", mode=RuntimeMode.LIVE
+        )
+        await repo.close()
+        return gaming, food
+
+    gaming, food = run(scenario())
+    assert gaming.expression[0].payload["style"] == "自嘲"
+    assert food.expression[0].payload["style"] == "馋"
+
+
+def test_expression_falls_back_to_weight_when_nothing_matches(tmp_path):
+    """A chat with no lexical overlap still has a voice.
+
+    Jargon that does not match is noise and is dropped; an expression pool
+    that does not match is still the only voice the bot has, so the weight
+    ordering remains the floor.
+    """
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        await commit_records(repo, "expression", [
+            make_record("expression", {
+                "situation": "打游戏输了", "style": "自嘲", "source_id": 1,
+            }),
+        ])
+        await commit_records(repo, "jargon", [
+            make_record("jargon", {
+                "term": "yyds", "meaning": "永远的神", "context": "夸赞",
+                "source_ids": [1],
+            }),
+        ])
+        service = AdaptiveContextService(repo, now=lambda: 100.0)
+        ctx = await service.build(
+            CK, pending_text="zzz", recent_text="", mode=RuntimeMode.LIVE
+        )
+        await repo.close()
+        return ctx
+
+    ctx = run(scenario())
+    assert ctx.reply_style == "当打游戏输了时，自嘲"
+    assert ctx.jargon == ()
+
+
+def test_summary_recall_cues_are_actually_queried(tmp_path):
+    """The summary learner is asked for ``recall_cues`` — "query-shaped
+    sentences used to retrieve this conversation later". Selecting summaries
+    by weight meant nothing ever retrieved them."""
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        await commit_records(repo, "summary", [
+            make_record("summary", {
+                "summary": "大家在讨论周末去爬山",
+                "recall_cues": ["谁提过爬山", "周末的计划是什么", "爬哪座山"],
+                "source_ids": [1],
+            }),
+            make_record("summary", {
+                "summary": "大家在讨论新出的手机",
+                "recall_cues": ["谁买了新手机", "手机多少钱", "哪款手机好"],
+                "source_ids": [2],
+            }),
+        ])
+        service = AdaptiveContextService(repo, now=lambda: 100.0)
+        ctx = await service.build(
+            CK, pending_text="周末爬山还去吗", recent_text="", mode=RuntimeMode.LIVE
+        )
+        await repo.close()
+        return ctx
+
+    ctx = run(scenario())
+    assert ctx.summary[0].payload["summary"] == "大家在讨论周末去爬山"
+
+
 def test_adaptive_context_no_pre_gate_read(tmp_path):
     """The service is only queried when the caller asks (after the gate
     triggers); building it performs no repository reads."""
@@ -610,3 +712,124 @@ def test_learner_worker_never_starts_in_dry_run(tmp_path):
         return app._learner_task
 
     assert run(scenario()) is None
+
+
+# ── impressions: the bot remembering who people are ─────────────────────────
+#
+# The committed records are the durable log; ``persons.impression`` is a
+# projection of them, applied after the commit rather than inside it.
+
+
+def _scheduler(repo, person_service=None):
+    return LearnerScheduler(
+        repo, object(), {"impression": IMPRESSION_SPEC},
+        VirtualClock(epoch=100.0), person_service=person_service,
+    )
+
+
+def test_impressions_project_onto_the_people_they_are_about(tmp_path):
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        people = PersonService(repo)
+        await people.observe(CK, SenderId("u1"), "小明", now=100.0)
+        run_id = await commit_records(repo, "impression", [
+            make_record("impression", {
+                "platform_uid": "u1", "name": "小明",
+                "impression": "爱聊游戏，说话很快", "source_id": 1,
+            }),
+        ])
+        await _scheduler(repo, people)._project_impressions(
+            CK, run_id, MessageRowId(2)
+        )
+        profile = await people.get_profile(CK, SenderId("u1"))
+        await repo.close()
+        return profile
+
+    profile = run(scenario())
+    assert profile is not None
+    assert profile.impression == "爱聊游戏，说话很快"
+    assert profile.profile_through_msg_id == 2
+    # The aliases ingest observed are preserved, not overwritten.
+    assert profile.names == ("小明",)
+
+
+def test_impression_never_conjures_a_person_who_has_not_spoken(tmp_path):
+    """Person rows are created by ingest's ``observe``, never by a model
+    response. An impression about an unknown UID is a no-op."""
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        people = PersonService(repo)
+        run_id = await commit_records(repo, "impression", [
+            make_record("impression", {
+                "platform_uid": "ghost", "name": "不存在",
+                "impression": "凭空出现的人", "source_id": 1,
+            }),
+        ])
+        await _scheduler(repo, people)._project_impressions(
+            CK, run_id, MessageRowId(2)
+        )
+        profile = await people.get_profile(CK, SenderId("ghost"))
+        await repo.close()
+        return profile
+
+    assert run(scenario()) is None
+
+
+def test_impression_projection_is_a_noop_on_a_stale_cas(tmp_path):
+    """Someone else moved the profile cursor first: the projection loses
+    quietly rather than clobbering the winner."""
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        people = PersonService(repo)
+        await people.observe(CK, SenderId("u1"), "小明", now=100.0)
+        run_id = await commit_records(repo, "impression", [
+            make_record("impression", {
+                "platform_uid": "u1", "name": "小明",
+                "impression": "输的那一版", "source_id": 1,
+            }),
+        ])
+        # A concurrent writer advances the cursor past what the projection
+        # will fence on.
+        await people.apply_profile(
+            CK, SenderId("u1"),
+            update=PersonProfile(
+                chat_key=CK, platform_uid=SenderId("u1"), names=("小明",),
+                impression="赢的那一版",
+            ),
+            through_msg_id=MessageRowId(9),
+            expected_through_msg_id=None,
+            now=100.0,
+        )
+        await _scheduler(repo, people)._project_impressions(
+            CK, run_id, MessageRowId(2)
+        )
+        profile = await people.get_profile(CK, SenderId("u1"))
+        await repo.close()
+        return profile
+
+    profile = run(scenario())
+    assert profile.impression == "赢的那一版"
+    assert profile.profile_through_msg_id == 9
+
+
+def test_impression_projection_disabled_without_a_person_service(tmp_path):
+    """No sink configured: the records still commit, they just do not reach
+    ``persons``. Never a raise."""
+    async def scenario():
+        db, repo = await open_repo_with_chat(tmp_path / "t.db")
+        await seed_messages(repo, n=2)
+        run_id = await commit_records(repo, "impression", [
+            make_record("impression", {
+                "platform_uid": "u1", "name": "小明",
+                "impression": "x", "source_id": 1,
+            }),
+        ])
+        await _scheduler(repo, None)._project_impressions(
+            CK, run_id, MessageRowId(2)
+        )
+        await repo.close()
+
+    run(scenario())

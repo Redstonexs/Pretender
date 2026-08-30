@@ -21,6 +21,9 @@ from pretender.learn import (
     EXPRESSION_FIELD_MAX,
     EXPRESSION_MAX,
     EXPRESSION_SPEC,
+    IMPRESSION_FIELD_MAX,
+    IMPRESSION_MAX,
+    IMPRESSION_SPEC,
     JARGON_MAX,
     JARGON_SPEC,
     SPECS,
@@ -35,7 +38,7 @@ from pretender.learn import (
 )
 from pretender.learn.effect import EFFECT_CATEGORIZATIONS
 from pretender.prompts import PACKAGE_PROMPT_DIR
-from pretender.types import ChatKey, LearnerBatch, MessageRowId
+from pretender.types import ChatKey, LearnerBatch, MessageRowId, SenderId
 
 CK = ChatKey("qq:group:123456")
 
@@ -55,18 +58,41 @@ def make_batch(
     )
 
 
+def make_attributed_batch(
+    texts: tuple[str, ...] = ("a", "b", "c"),
+    senders: tuple[str, ...] = ("u1", "u2", "u1"),
+    names: tuple[str, ...] = ("小明", "小红", "小明"),
+) -> LearnerBatch:
+    """A batch that carries who said what — what the impression learner needs."""
+    return LearnerBatch(
+        chat_key=CK,
+        learner="impression",
+        first_msg_id=MessageRowId(1),
+        last_msg_id=MessageRowId(len(texts)),
+        source_hash=source_hash(texts),
+        texts=texts,
+        observed_watermark=MessageRowId(0),
+        senders=tuple(SenderId(u) for u in senders),
+        sender_names=names,
+    )
+
+
 def validate(name: str, parsed, batch=None):
     return VALIDATORS[name](parsed, batch or make_batch(learner=name), now=100.0)
 
 
 # ── the five specs ──────────────────────────────────────────────────────────
 
-def test_five_specs_defined_with_frozen_policy():
-    assert set(SPECS) == {"expression", "behavior", "jargon", "summary", "effect"}
-    # Nonself SQL policy for expression/jargon/peer behavior.
+def test_six_specs_defined_with_frozen_policy():
+    assert set(SPECS) == {
+        "expression", "behavior", "jargon", "summary", "effect", "impression",
+    }
+    # Nonself SQL policy for expression/jargon/peer behavior/impression: the
+    # bot never forms an impression of itself.
     assert EXPRESSION_SPEC.policy == "nonself"
     assert JARGON_SPEC.policy == "nonself"
     assert BEHAVIOR_SPEC.policy == "nonself"
+    assert IMPRESSION_SPEC.policy == "nonself"
     # Summary/effect read the FULL conversation (including the bot's own).
     assert SUMMARY_SPEC.policy == "all"
     assert EFFECT_SPEC.policy == "all"
@@ -118,7 +144,9 @@ def test_expression_validator_rejects_bad_shapes():
         [{"situation": "x", "style": "y"}],  # missing source_id
         [{"situation": "x", "style": "y", "source_id": 0}],  # ref out of range
         [{"situation": "x", "style": "y", "source_id": 4}],  # ref beyond batch
-        [{"situation": "x", "style": "y", "source_id": "1"}],  # non-int ref
+        [{"situation": "x", "style": "y", "source_id": "abc"}],  # non-numeric ref
+        [{"situation": "x", "style": "y", "source_id": True}],  # bool is not a ref
+        [{"situation": "x", "style": "y", "source_id": "9"}],  # quoted, out of range
         [{"situation": "x" * (EXPRESSION_FIELD_MAX + 1), "style": "y", "source_id": 1}],
         [{"situation": "x", "style": "y" * (EXPRESSION_FIELD_MAX + 1), "source_id": 1}],
         [{"situation": "x", "style": "y", "source_id": 1, "weight": 5.0}],
@@ -372,3 +400,119 @@ def test_parse_json_response_roundtrips_spec_outputs():
     for spec in SPECS.values():
         # Every spec's validator output must be re-parseable from its JSON.
         assert parse_json_response(json.dumps([])) == []
+
+# ── impression: who the bot thinks these people are ─────────────────────────
+
+
+def test_impression_validator_resolves_the_ref_to_a_real_person():
+    """The model names a person only by an opaque ref to something they
+    wrote; the code resolves that to the real UID. An untrusted response can
+    therefore never invent an identity or point outside the batch."""
+    records = validate(
+        "impression",
+        [
+            {"source_id": 1, "impression": "爱聊游戏，说话很快，喜欢用梗"},
+            {"source_id": 2, "impression": "话不多，但每次都接得挺准"},
+        ],
+        make_attributed_batch(),
+    )
+    assert len(records) == 2
+    assert records[0].payload["platform_uid"] == "u1"
+    assert records[0].payload["name"] == "小明"
+    assert records[1].payload["platform_uid"] == "u2"
+    assert records[1].payload["impression"].startswith("话不多")
+
+
+def test_impression_validator_rejects_bad_shapes():
+    batch = make_attributed_batch()
+    base = {"source_id": 1, "impression": "爱聊游戏"}
+    bad_inputs = [
+        "not-a-list",
+        [{"source_id": i + 1, "impression": "x"} for i in range(IMPRESSION_MAX + 1)],
+        [{**base, "impression": ""}],
+        [{**base, "impression": "长" * (IMPRESSION_FIELD_MAX + 1)}],
+        [{**base, "source_id": 0}],
+        [{**base, "source_id": 99}],
+        [{**base, "source_id": True}],
+        [{**base, "weight": 2.0}],
+        ["not-an-object"],
+    ]
+    for bad in bad_inputs:
+        with pytest.raises(LearnerValidationError):
+            validate("impression", bad, batch)
+
+
+def test_impression_validator_rejects_two_records_for_one_person():
+    # refs 1 and 3 are both u1 — one person, one impression.
+    with pytest.raises(LearnerValidationError):
+        validate(
+            "impression",
+            [
+                {"source_id": 1, "impression": "爱聊游戏"},
+                {"source_id": 3, "impression": "其实很安静"},
+            ],
+            make_attributed_batch(),
+        )
+
+
+def test_impression_validator_refuses_a_batch_with_no_sender_identity():
+    """Fail closed: with nothing to attribute to, an impression would have
+    to be guessed onto someone."""
+    with pytest.raises(LearnerValidationError):
+        validate("impression", [{"source_id": 1, "impression": "x"}], make_batch())
+
+
+def test_impression_validator_accepts_empty():
+    assert validate("impression", [], make_attributed_batch()) == []
+
+
+def test_sender_columns_do_not_change_the_source_identity():
+    """The batch's ``source_hash`` is computed from the TEXTS alone, so
+    adding sender columns leaves every existing learner watermark and CAS
+    fence byte-identical."""
+    texts = ("a", "b", "c")
+    plain = make_batch(texts)
+    attributed = make_attributed_batch(texts)
+    assert plain.source_hash == attributed.source_hash == source_hash(texts)
+
+
+def test_batch_rejects_misaligned_sender_columns():
+    for kwargs in (
+        {"senders": (SenderId("u1"),)},
+        {"sender_names": ("小明",)},
+    ):
+        with pytest.raises(ValueError):
+            LearnerBatch(
+                chat_key=CK,
+                learner="impression",
+                first_msg_id=MessageRowId(1),
+                last_msg_id=MessageRowId(3),
+                source_hash=source_hash(("a", "b", "c")),
+                texts=("a", "b", "c"),
+                **kwargs,
+            )
+
+
+def test_a_quoted_ref_is_still_a_ref():
+    """Small models quote integers constantly, and it used to throw away the
+    whole run. The ref is bounds-checked against the batch either way, so the
+    quoted spelling cannot widen what the model can point at."""
+    records = validate(
+        "expression",
+        [{"situation": "打游戏", "style": "自嘲", "source_id": "2"}],
+    )
+    assert records[0].payload["source_id"] == 2
+
+    records = validate(
+        "jargon",
+        [{"term": "yyds", "meaning": "永远的神", "context": "夸赞",
+          "source_ids": ["1", 2]}],
+    )
+    assert records[0].payload["source_ids"] == [1, 2]
+
+    records = validate(
+        "impression",
+        [{"source_id": "1", "impression": "爱聊游戏"}],
+        make_attributed_batch(),
+    )
+    assert records[0].payload["platform_uid"] == "u1"

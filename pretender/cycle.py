@@ -112,6 +112,7 @@ from pretender.registry import (
     configured_plugin_manifest,
     feature_implementation_fingerprint,
 )
+from pretender.access import is_muted
 from pretender.drift import build_drift_block
 from pretender.replyer import ReplyContext, Replyer
 from pretender.seams import LLMClient, Repository
@@ -190,6 +191,7 @@ def assemble_snapshot(
     now: float,
     self_name: str | None,
     self_aliases: tuple[str, ...] = (),
+    muted: bool = False,
     previous_end_reason: str | None,
     window_s: float = SNAPSHOT_WINDOW_S,
     quote_self_ids: frozenset[MessageId] = frozenset(),
@@ -211,6 +213,9 @@ def assemble_snapshot(
     - ``has_other_assistant``: the signals refusal detector over the
       normalized pending texts.
     - ``self_name``: the bot config name (name mention scoring input).
+    - ``muted``: the caller's ``[access]`` verdict for this chat. Passed in
+      rather than derived here because access is a TOP-LEVEL policy, not a
+      per-chat merged section.
     - ``self_ratio``: the exact full-window ratio ``self_count /
       window_count`` (0.0 on an empty window).
     - ``idle_seconds``: ``now - last_nonself_ts``; when the window holds no
@@ -255,6 +260,7 @@ def assemble_snapshot(
         last_message=recent.messages[0] if recent.messages else None,
         self_name=self_name,
         self_aliases=self_aliases,
+        muted=muted,
         has_direct_at=any(self_id in m.mentions for m in pending),
         has_quote_to_self=_quote_to_self(pending, recent.messages, quote_self_ids),
         has_other_assistant=any(
@@ -328,12 +334,14 @@ class AdaptiveContextService:
     """Deterministic adaptive selection/context service (Phase 6 P6.4b).
 
     Builds the frozen per-dispatch ``AdaptiveContext`` from the
-    ``AdaptiveRepository``: expression records become the reply style,
-    jargon is scoped to the current pending/recent text, and summary/
-    behavior are bounded context slots. Selection is deterministic
-    (vector score with deterministic weight/uses/id tie-breaks when an active
-    record-vector space is available, FTS for jargon, weight/uses for the other slots, id-ascending recency
-    tiebreaks), capped at ``MAX_PER_SLOT`` records per slot and
+    ``AdaptiveRepository``: expression records become the reply style, and
+    jargon/summary/behavior are bounded context slots. EVERY slot is scoped
+    to the current pending/recent text, so the voice and the references move
+    with the conversation instead of being frozen at whatever the learners
+    weighted highest. Selection is deterministic (record FTS merged with
+    vector score when an active record-vector space is available, ranked by
+    score then weight/uses/id, with the weight ordering as the fallback for
+    every slot but jargon), capped at ``MAX_PER_SLOT`` records per slot and
     ``MAX_TOTAL_CHARS`` escaped chars total, and never includes legacy or
     retired records (the repository surface already excludes them). The
     service is queried ONLY after the gate triggers (the agent dispatch
@@ -342,9 +350,9 @@ class AdaptiveContextService:
 
     MAX_PER_SLOT = 3
     MAX_TOTAL_CHARS = 1200
-    #: The bounded jargon query text (the current pending/recent text is
+    #: The bounded relevance query (the current pending/recent text is
     #: truncated before it is tokenized into the FTS MATCH).
-    _JARGON_QUERY_MAX = 400
+    _QUERY_MAX = 400
 
     def __init__(
         self, repo: Any, *, now: Callable[[], float] | None = None,
@@ -371,11 +379,16 @@ class AdaptiveContextService:
         semantic = await self._semantic_records(
             chat_key, f"{pending_text} {recent_text}".strip()
         )
-        expression = await self._select(chat_key, "expression", semantic=semantic)
-        summary = await self._select(chat_key, "summary", semantic=semantic)
-        behavior = await self._select(chat_key, "behavior", semantic=semantic)
-        jargon = await self._jargon_for(
-            chat_key, pending_text, recent_text, semantic=semantic
+        query = f"{pending_text} {recent_text}".strip()[: self._QUERY_MAX]
+        expression = await self._relevant(
+            chat_key, "expression", query, semantic=semantic
+        )
+        summary = await self._relevant(chat_key, "summary", query, semantic=semantic)
+        behavior = await self._relevant(chat_key, "behavior", query, semantic=semantic)
+        # Jargon alone never falls back to the weight ordering: slang that
+        # does not match what is being said is noise, not context.
+        jargon = await self._relevant(
+            chat_key, "jargon", query, semantic=semantic, fallback=False
         )
         reply_style = _render_reply_style(expression)
         rendered, frozen = self._render(expression, jargon, summary, behavior)
@@ -389,59 +402,65 @@ class AdaptiveContextService:
             rendered=rendered,
         )
 
-    async def _select(
-        self, chat_key: ChatKey, learner: str, *,
+    async def _relevant(
+        self, chat_key: ChatKey, learner: str, query: str, *,
         semantic: dict[int, tuple[Record, float]] | None = None,
+        fallback: bool = True,
     ) -> list[Record]:
-        """Highest-weight, least-used records (deterministic; the repository
-        orders by weight DESC, uses ASC, id ASC)."""
+        """The records that match what is being said right now.
+
+        ``query`` is the bounded current pending/recent text. Lexical (FTS)
+        and semantic hits are merged and ranked deterministically by
+        ``(-score, -weight, uses, id)``.
+
+        Relevance is the point. Selecting the highest-weight records instead
+        would hand the replyer the same three expressions in every
+        conversation forever, which is exactly how a bot sounds: a person's
+        register moves with the topic. MaiBot picks the situations matching
+        the current context (``maisaka_expression_selector``); this reaches
+        the same place through the record FTS index rather than a second
+        provider call.
+
+        ``fallback`` decides what an unmatched slot does. Expression,
+        behavior and summary fall back to the weight ordering so a chat with
+        no lexical overlap still has a voice; jargon does not, because
+        unmatched slang is noise.
+        """
+        combined: dict[int, tuple[Record, float]] = {}
+        if query:
+            try:
+                hits = await self._repo.query_records(
+                    chat_key, learner, query, limit=self.MAX_PER_SLOT
+                )
+            except Exception:
+                hits = []
+            if hits:
+                by_id = await self._records_by_id(chat_key, learner)
+                combined = {
+                    hit.record_id: (by_id[hit.record_id], 1.0 / (10 + i))
+                    for i, hit in enumerate(hits) if hit.record_id in by_id
+                }
+        for record_id, (record, score) in (semantic or {}).items():
+            if record.learner == learner:
+                previous = combined.get(record_id)
+                combined[record_id] = (
+                    record, score + (previous[1] if previous else 0.0)
+                )
+        if combined:
+            return [record for record, _score in sorted(
+                combined.values(),
+                key=lambda item: (
+                    -item[1], -item[0].weight, item[0].uses, item[0].id or 0
+                ),
+            )[: self.MAX_PER_SLOT]]
+        if not fallback:
+            return []
         try:
-            if semantic:
-                ranked = [
-                    value for value in semantic.values()
-                    if value[0].learner == learner
-                ]
-                if ranked:
-                    ranked.sort(key=lambda item: (
-                        -item[1], -item[0].weight, item[0].uses, item[0].id or 0
-                    ))
-                    return [record for record, _score in ranked[: self.MAX_PER_SLOT]]
             return await self._repo.select_learner_records(
                 chat_key, learner, limit=self.MAX_PER_SLOT
             )
         except Exception:
             return []
-
-    async def _jargon_for(
-        self, chat_key: ChatKey, pending_text: str, recent_text: str,
-        *, semantic: dict[int, tuple[Record, float]] | None = None,
-    ) -> list[Record]:
-        """Jargon scoped to the current pending/recent text: the FTS query
-        is the bounded current text, so only jargon whose term/meaning/
-        context matches the live conversation is selected."""
-        query = f"{pending_text} {recent_text}".strip()
-        if not query:
-            return []
-        query = query[: self._JARGON_QUERY_MAX]
-        try:
-            hits = await self._repo.query_records(
-                chat_key, "jargon", query, limit=self.MAX_PER_SLOT
-            )
-        except Exception:
-            return []
-        by_id = await self._records_by_id(chat_key, "jargon")
-        combined: dict[int, tuple[Record, float]] = {
-            h.record_id: (by_id[h.record_id], 1.0 / (10 + i))
-            for i, h in enumerate(hits) if h.record_id in by_id
-        }
-        for record_id, (record, score) in (semantic or {}).items():
-            if record.learner == "jargon":
-                old = combined.get(record_id)
-                combined[record_id] = (record, score + (old[1] if old else 0.0))
-        return [record for record, _score in sorted(
-            combined.values(),
-            key=lambda item: (-item[1], -item[0].weight, item[0].uses, item[0].id or 0),
-        )[: self.MAX_PER_SLOT]]
 
     async def _semantic_records(
         self, chat_key: ChatKey, query: str
@@ -805,13 +824,15 @@ repair: Callable[[str], str] | None = None,
         deadline: float | None = None,
         recent: Sequence[Message] = (),
         reply_style: str | None = None,
+        behavior_style: str = "",
     ) -> AgentOutcome:
         """Run the deterministic agent sequence for one trigger.
 
         ``messages`` is the pending chat history in transcript form (the
         caller converts inbound ``Message``s); ``chat_log`` is the plain-text
         chat rendering embedded in the planner system prompt; ``identity`` is
-        the bot identity string; ``deadline`` is the aggregate saga deadline
+        the bot identity string (the replyer's half of the persona) and
+        ``behavior_style`` the planner's half — when to speak, when not to; ``deadline`` is the aggregate saga deadline
         (``now + max_execution_s``) the planner/replyer LLM calls are bounded
         by. ``recent`` is the current dispatch's recent ``Message`` snapshot
         the budgeted form injects into the real ``ToolContext`` (for
@@ -825,6 +846,7 @@ repair: Callable[[str], str] | None = None,
             return await self._run_budgeted(
                 chat_key=chat_key,
                 identity=identity,
+                behavior_style=behavior_style,
                 chat_log=chat_log,
                 messages=messages,
                 focus_chat=focus_chat,
@@ -837,6 +859,7 @@ repair: Callable[[str], str] | None = None,
         return await self._run_injected(
             chat_key=chat_key,
             identity=identity,
+            behavior_style=behavior_style,
             chat_log=chat_log,
             messages=messages,
             focus_chat=focus_chat,
@@ -846,8 +869,9 @@ repair: Callable[[str], str] | None = None,
             reply_style=style,
         )
 
-    def _reply_context(
+    async def _reply_context(
         self,
+        chat_key: ChatKey,
         recent: Sequence[Message],
         self_name: str | None,
         reply_to: str | None,
@@ -857,7 +881,8 @@ repair: Callable[[str], str] | None = None,
 
         Built from the SAME ``recent`` snapshot the planner scored, so the two
         stages never disagree about what was said. The drift block is a pure
-        function of config, so it costs nothing to compute here.
+        function of config, so it costs nothing to compute here; the
+        impressions are a bounded read of people already in the window.
         """
         target = None
         if reply_to:
@@ -872,7 +897,50 @@ repair: Callable[[str], str] | None = None,
             now=self._now() if self._now is not None else None,
             drift_block=self._drift_block(),
             length_style=length_style or "",
+            impressions=await self._impressions(chat_key, recent),
         )
+
+    #: How many people's impressions ride along in one reply request. Bounded
+    #: like every other adaptive slot: a wall of dossiers is not context.
+    MAX_IMPRESSIONS = 3
+
+    async def _impressions(
+        self, chat_key: ChatKey, recent: Sequence[Message]
+    ) -> tuple[tuple[str, str], ...]:
+        """What the bot thinks of the people who actually spoke here.
+
+        Read from ``persons`` (the impression learner's projection) for the
+        distinct non-self senders in the current window, newest speaker
+        first. Every failure degrades to no impressions — never a raise, and
+        never a provider call.
+
+        Both the name and the impression are escaped: the name came off the
+        wire and the impression is model-written text about untrusted chat,
+        so neither may close the prompt's own structure.
+        """
+        if self._person_service is None:
+            return ()
+        seen: list[SenderId] = []
+        for msg in reversed(list(recent)):
+            if msg.is_self or msg.sender_id in seen:
+                continue
+            seen.append(msg.sender_id)
+            if len(seen) >= self.MAX_IMPRESSIONS:
+                break
+        out: list[tuple[str, str]] = []
+        for uid in seen:
+            try:
+                profile = await self._person_service.get_profile(chat_key, uid)
+            except Exception:
+                continue
+            if profile is None or not (profile.impression or "").strip():
+                continue
+            name = profile.names[0] if profile.names else str(uid)
+            out.append((
+                escape_untrusted(name),
+                escape_untrusted(profile.impression.strip()),
+            ))
+        return tuple(out)
 
     def _bot_name(self, self_name: str | None) -> str:
         """The name the prompts address the bot by."""
@@ -891,6 +959,7 @@ repair: Callable[[str], str] | None = None,
         *,
         chat_key: ChatKey,
         identity: str,
+        behavior_style: str,
         chat_log: str,
         messages: Sequence[TranscriptMessage],
         focus_chat: str | None,
@@ -904,12 +973,12 @@ repair: Callable[[str], str] | None = None,
         own per-call budget)."""
         result = await self._planner.plan(
             messages,
-            identity=identity,
             chat_log=chat_log,
             reply_style=reply_style,
             focus_chat=focus_chat,
             bot_name=self._bot_name(self_name),
             drift_block=self._drift_block(),
+            behavior_style=behavior_style,
             tools=self._tools,
             temperature=self._temperature,
             max_tokens=self._max_tokens,
@@ -922,8 +991,9 @@ repair: Callable[[str], str] | None = None,
                 identity=identity,
                 reply_style=reply_style,
                 reply_to=result.reply_to,
-                context=self._reply_context(
-                    recent, self_name, result.reply_to, result.length_style
+                context=await self._reply_context(
+                    chat_key, recent, self_name, result.reply_to,
+                    result.length_style,
                 ),
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
@@ -973,6 +1043,7 @@ repair: Callable[[str], str] | None = None,
         *,
         chat_key: ChatKey,
         identity: str,
+        behavior_style: str,
         chat_log: str,
         messages: Sequence[TranscriptMessage],
         focus_chat: str | None,
@@ -1075,12 +1146,12 @@ repair: Callable[[str], str] | None = None,
         try:
             result = await planner.plan(
                 messages,
-                identity=identity,
                 chat_log=chat_log,
                 reply_style=reply_style,
                 focus_chat=focus_chat,
                 bot_name=self._bot_name(self_name),
                 drift_block=self._drift_block(),
+                behavior_style=behavior_style,
                 tools=self._tools,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
@@ -1120,8 +1191,9 @@ repair: Callable[[str], str] | None = None,
                     identity=identity,
                     reply_style=reply_style,
                     reply_to=result.reply_to,
-                    context=self._reply_context(
-                        recent, self_name, result.reply_to, result.length_style
+                    context=await self._reply_context(
+                        chat_key, recent, self_name, result.reply_to,
+                        result.length_style,
                     ),
                     temperature=self._temperature,
                     max_tokens=self._max_tokens,
@@ -1614,6 +1686,7 @@ class CycleRunner:
                 now=now,
                 self_name=self._cfg.bot.name,
                 self_aliases=tuple(self._cfg.bot.alias_names),
+                muted=is_muted(self._cfg.access, chat_key),
                 previous_end_reason=previous_end_reason,
                 window_s=self._window_s,
                 quote_self_ids=quote_self_ids,
@@ -1717,6 +1790,7 @@ class CycleRunner:
             now=now,
             self_name=self._cfg.bot.name,
             self_aliases=tuple(self._cfg.bot.alias_names),
+            muted=is_muted(self._cfg.access, chat_key),
             previous_end_reason=previous_end_reason,
             window_s=self._window_s,
             quote_self_ids=quote_self_ids,
@@ -1882,6 +1956,7 @@ class CycleRunner:
                 self._agent.run(
                     chat_key=chat_key,
                     identity=self._resolve_identity(),
+                    behavior_style=self._resolve_behavior_style(),
                     chat_log=chat_log,
                     messages=_pending_transcript(snapshot.pending_messages),
                     chat_kind="group" if snapshot.is_group else "private",
@@ -2400,6 +2475,20 @@ class CycleRunner:
             return text.strip()
         return f"你是{self._cfg.bot.name}"
 
+    def _resolve_behavior_style(self) -> str:
+        """The planner's action rules (MaiBot's ``behavior_style``).
+
+        Loaded from ``bot.behavior_file`` through the same prompt
+        infrastructure as the identity, so a user ``prompts/behavior.txt``
+        shadows the shipped default. A missing or unreadable file degrades
+        to ``""`` — the planner keeps its own decision rules and simply
+        loses the persona's slant on them.
+        """
+        try:
+            return self._prompts.load_identity(self._cfg.bot.behavior_file).strip()
+        except PromptError:
+            return ""
+
     async def _resolve_quote_targets(
         self, chat_key: ChatKey, pending: tuple[Message, ...]
     ) -> frozenset[MessageId]:
@@ -2884,6 +2973,7 @@ def replay_corpus(
             cfg=chat_cfg,
             now=now,
             self_name=self_name,
+            muted=is_muted(cfg.access, chat_key),
             previous_end_reason=previous_end_reason,
             window_s=window_s,
             quote_self_ids=quote_self_ids,
@@ -3485,6 +3575,7 @@ def replay_marker_schedule(
             cfg=chat_cfg,
             now=now,
             self_name=self_name,
+            muted=is_muted(cfg.access, chat_key),
             previous_end_reason=previous_end_reason,
             window_s=window_s,
             quote_self_ids=quote_self_ids,

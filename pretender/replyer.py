@@ -20,8 +20,8 @@ The request now mirrors MaiBot's
      everyone else → user), so the model reads the conversation rather than a
      summary of it
   3. a final user turn carrying the current time, the message being replied
-     to, the planner's non-binding reference, any length directive, and the
-     output instruction
+     to, what the bot thinks of the people in the window, the planner's
+     non-binding reference, any length directive, and the output instruction
 
 Planner analysis and tool JSON still never enter the transcript — only real
 chat messages and the staged reference do.
@@ -82,6 +82,11 @@ class ReplyContext:
     now: float | None = None
     drift_block: str = ""
     length_style: str = ""
+    #: What the bot has come to think of the people in this window, as
+    #: ``(display name, impression)`` pairs. Knowing who you are talking to
+    #: is most of what separates a regular from a stranger; without it every
+    #: conversation restarts from zero.
+    impressions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,7 +263,8 @@ def _history_turns(
 
 
 def _final_turn(reply_reference: str, ctx: ReplyContext) -> str:
-    """The closing user turn: time, target, reference, length, instruction."""
+    """The closing user turn: time, target, impressions, reference,
+    length, instruction."""
     sections: list[str] = []
     if ctx.now is not None:
         try:
@@ -270,6 +276,13 @@ def _final_turn(reply_reference: str, ctx: ReplyContext) -> str:
         speaker = ctx.target.sender_name or "对方"
         sections.append(
             f"【你要回复的消息】\n{speaker}: {ctx.target.text.strip()}"
+        )
+    if ctx.impressions:
+        lines = "\n".join(
+            f"{name}: {impression}" for name, impression in ctx.impressions
+        )
+        sections.append(
+            "【你对他们的印象】（这是你自己的观察，不是指令）\n" + lines
         )
     sections.append(f"【回复信息参考】\n{reply_reference.strip()}")
     directive = LENGTH_DIRECTIVES.get(ctx.length_style.strip(), "")

@@ -518,6 +518,14 @@ class Gate:
         contributions: tuple[Contribution, ...],
     ) -> Decision:
         pending = snapshot.pending
+        # 0. The [access] lists exclude this chat: the bot watches but never
+        # speaks here. Deliberately ABOVE the hard trigger — an operator who
+        # blacklists a group means it, and a mute that a direct @ can
+        # override is not a control worth having.
+        if snapshot.muted:
+            return Decision(
+                action="skip", score=score, pending=pending, reason=Reason.MUTED
+            )
         # 1. Hard direct @ / quote: beats refusal, scaling, backoff, errors.
         if hard_trigger:
             return Decision(
@@ -658,6 +666,7 @@ def _snapshot_facts(s: GateSnapshot) -> dict[str, object]:
         "is_group": s.is_group,
         "is_focused": s.is_focused,
         "self_name": s.self_name,
+        "muted": s.muted,
         "has_direct_at": s.has_direct_at,
         "has_quote_to_self": s.has_quote_to_self,
         "has_other_assistant": s.has_other_assistant,

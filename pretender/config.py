@@ -111,11 +111,19 @@ class BotConfig:
 
     ``alias_names`` are MaiBot's ``bot.alias_names``: other things people call
     it in this group, which also score as a name mention. Empty by default.
+
+    The persona is split the way MaiBot's ``PersonalityConfig`` splits it.
+    ``identity_file`` is the replyer's ``personality`` — who the bot is and
+    how it talks. ``behavior_file`` is the planner's ``behavior_style`` —
+    when to join in, when to stay quiet, how to read the room. They are
+    different jobs: a planner told "speak naturally and briefly" has been
+    told nothing at all about whether to speak.
     """
 
     name: str = "麦麦"
     alias_names: tuple[str, ...] = ()
     identity_file: str = "prompts/identity.txt"
+    behavior_file: str = "prompts/behavior.txt"
     prompt_dir: str = "prompts"  # user prompt dir; overlays package defaults
 
     def __post_init__(self) -> None:
@@ -227,6 +235,67 @@ class GateConfig:
 
 
 @dataclass(frozen=True)
+class AccessListConfig:
+    """One allow/deny list, in MaiBot's ``enabled + mode + list`` shape.
+
+    ``enabled = false`` silences the whole category outright — no group
+    replies at all, or no private replies at all.
+
+    ``mode`` is ``blacklist`` (listed chats are silenced, every other chat
+    replies) or ``whitelist`` (ONLY listed chats reply). The default is an
+    EMPTY blacklist, which allows everything: adding the section changes
+    nothing until ids are listed.
+
+    ``ids`` accepts the bare platform id (``"123456"``) or the whole chat
+    key (``"qq:group:123456"``) — an operator reading the log sees the
+    latter, so both are matched rather than making them translate.
+    """
+
+    enabled: bool = True
+    mode: str = "blacklist"
+    ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"access enabled must be a boolean, got {self.enabled!r}"
+            )
+        if self.mode not in ("blacklist", "whitelist"):
+            raise ConfigError(
+                "access mode must be 'blacklist' or 'whitelist', got "
+                f"{self.mode!r}"
+            )
+        for entry in self.ids:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ConfigError(
+                    f"access ids entries must be non-empty strings, got {entry!r}"
+                )
+
+
+@dataclass(frozen=True)
+class AccessConfig:
+    """Where the bot is allowed to speak at all.
+
+    Distinct from ``[gate]``, which decides whether THIS moment is worth
+    replying to. Access is prior to that: a chat the lists exclude is never
+    replied to, not even when the bot is directly @-ed. It is still read,
+    stored and learned from — the bot watches, it just does not talk.
+    """
+
+    groups: AccessListConfig = field(default_factory=AccessListConfig)
+    private: AccessListConfig = field(default_factory=AccessListConfig)
+
+    def __post_init__(self) -> None:
+        for name in ("groups", "private"):
+            value = getattr(self, name)
+            if not isinstance(value, AccessListConfig):
+                raise ConfigError(
+                    f"access.{name} must be an AccessListConfig table, got "
+                    f"{type(value).__name__}"
+                )
+
+
+@dataclass(frozen=True)
 class DriftConfig:
     level: str = "active"      # subtle | active | scattered | wild
     anchor: str = "balanced"   # strict | balanced | loose
@@ -245,7 +314,10 @@ class OutputConfig:
     ``chinese_typo.min_freq``, the floor that keeps a substitution from
     picking an obscure character nobody would actually mistype;
     ``typo_correction_probability`` its ``chinese_typo`` 50/50 between
-    "show the typo then send the correct word" and "quietly send it clean".
+    "show the typo then send the correct word" and "quietly send it clean";
+    ``typing_speed`` its ``response_post_process.typing_speed``, the
+    multiplier on how long a person takes to type each bubble (0 sends the
+    whole reply at once, 1 is human, 2 is slow).
 
     MaiBot additionally has ``tone_error_rate`` and ``word_replace_rate`` for
     tone-only and whole-word homophone errors. Pretender's typo lane is
@@ -259,6 +331,7 @@ class OutputConfig:
     typo_rate: float = 0.01
     typo_min_freq: int = 9
     typo_correction_probability: float = 0.5
+    typing_speed: float = 1.0
 
     def __post_init__(self) -> None:
         _check_positive_int("output.max_split", self.max_split)
@@ -269,6 +342,12 @@ class OutputConfig:
             _check_finite_nonneg(f"output.{name}", value)
             if value > 1:
                 raise ConfigError(f"output.{name} must be between 0 and 1, got {value!r}")
+        _check_finite_nonneg("output.typing_speed", self.typing_speed)
+        if self.typing_speed > 2:
+            raise ConfigError(
+                "output.typing_speed must be between 0 and 2, got "
+                f"{self.typing_speed!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -728,6 +807,7 @@ class Config:
     bot: BotConfig = field(default_factory=BotConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     gate: GateConfig = field(default_factory=GateConfig)
+    access: AccessConfig = field(default_factory=AccessConfig)
     drift: DriftConfig = field(default_factory=DriftConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     context: ContextConfig = field(default_factory=ContextConfig)

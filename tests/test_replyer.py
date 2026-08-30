@@ -361,3 +361,31 @@ def test_empty_history_entries_are_skipped():
 def test_no_context_degrades_to_the_reference_only_request():
     msgs = _reply_with_context(None)
     assert [m.role for m in msgs] == ["system", "user"]
+
+
+def test_impressions_of_the_people_here_reach_the_final_turn():
+    """Knowing who you are talking to is most of what separates a regular
+    from a stranger. Without this the bot restarts every conversation from
+    zero, no matter how many times it has met the person."""
+    from pretender.replyer import ReplyContext
+
+    msgs = _reply_with_context(
+        ReplyContext(
+            impressions=(
+                ("小明", "爱聊游戏，说话很快"),
+                ("小红", "话不多，但每次都接得挺准"),
+            )
+        )
+    )
+    final = msgs[-1].content
+    assert "【你对他们的印象】" in final
+    assert "小明: 爱聊游戏，说话很快" in final
+    assert "小红: 话不多，但每次都接得挺准" in final
+    # It is an observation, not an order.
+    assert "不是指令" in final
+
+
+def test_no_impressions_adds_no_block():
+    from pretender.replyer import ReplyContext
+
+    assert "【你对他们的印象】" not in _reply_with_context(ReplyContext())[-1].content

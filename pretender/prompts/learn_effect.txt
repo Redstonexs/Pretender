@@ -11,5 +11,6 @@
 - 输出一个 JSON 对象，包含两个字段：
   - "categorization": "adopted"（被采纳）/ "partial"（部分采纳）/ "rejected"（未被采纳）
   - "confidence": 0 到 1 之间的置信度数字
-- 只输出 JSON 对象本身（可包裹在单个 ```json 代码围栏中），不要输出任何其他文字、解释或分析。
+- 只输出 JSON 对象本身。可以整体包裹在单个 ```json 代码围栏里，但围栏之前、之后都不能有任何文字。
+- 不要写开场白、结尾语、解释或分析，不要在 JSON 之外补充说明。
 - 禁止输出 weight、uses、delta、score_delta 等字段——权重调整由代码决定。

@@ -3508,7 +3508,7 @@ class SqliteRepository:
             # SQL-bounded I/O: the OLDEST bounded unsummarized chunk is
             # selected with a LIMIT, never fetch-all-then-slice.
             sql = (
-                "SELECT id, text FROM messages"
+                "SELECT id, text, sender_id, sender_name FROM messages"
                 " WHERE chat_key = ? AND id > ? AND id <= ?"
                 + self_filter
                 + " ORDER BY id LIMIT ?"
@@ -3522,11 +3522,16 @@ class SqliteRepository:
                 learner=learner,
                 first_msg_id=MessageRowId(rows[0][0]),
                 last_msg_id=MessageRowId(rows[-1][0]),
+                # Computed from the TEXTS only: the sender columns below are
+                # additional context for the impression learner and must
+                # never move an existing watermark's source identity.
                 source_hash=self._source_hash(texts),
                 texts=texts,
                 observed_watermark=MessageRowId(wm) if wm else MessageRowId(0),
                 policy=policy,
                 source_ids=tuple(MessageRowId(r[0]) for r in rows),
+                senders=tuple(SenderId(str(r[2])) for r in rows),
+                sender_names=tuple(str(r[3] or "") for r in rows),
             )
 
         return await self._db.read(fn)

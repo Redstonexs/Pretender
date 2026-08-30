@@ -199,12 +199,12 @@ class Planner:
         self,
         messages: Iterable[TranscriptMessage],
         *,
-        identity: str,
         chat_log: str,
         reply_style: str,
         focus_chat: str | None = None,
         bot_name: str = "",
         drift_block: str = "",
+        behavior_style: str = "",
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -223,9 +223,16 @@ class Planner:
         attention-drift rules — drift governs WHICH pending message gets
         latched onto, which is a planner decision, so it belongs in both
         prompts rather than the replyer alone.
+
+        ``behavior_style`` is MaiBot's ``behavior_style``: the persona's
+        rules for WHEN to speak and when to stay out of it. The planner
+        decides whether to say anything at all, so this — not the replyer's
+        ``identity``, which is about how sentences are phrased — is the half
+        of the persona it needs. The replyer keeps ``identity``; the planner
+        never sees it, exactly as in MaiBot's ``maisaka_chat.prompt``.
         """
-        if not isinstance(identity, str) or not isinstance(reply_style, str):
-            raise ValueError("identity and reply_style must be strings")
+        if not isinstance(reply_style, str):
+            raise ValueError("reply_style must be a string")
         if not isinstance(chat_log, str):
             raise ValueError("chat_log must be a string")
         cap = max_tool_rounds if max_tool_rounds is not None else self._max_tool_rounds
@@ -234,11 +241,11 @@ class Planner:
 
         prompt_name = PLANNER_FOCUS_PROMPT if focus_chat else PLANNER_PROMPT
         variables: dict[str, object] = {
-            "identity": identity,
             "chat_log": chat_log,
             "reply_style": reply_style,
             "bot_name": bot_name,
             "drift_block": drift_block,
+            "behavior_style": behavior_style,
         }
         if focus_chat is not None:
             variables["focus_chat"] = focus_chat

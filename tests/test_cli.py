@@ -830,7 +830,7 @@ def test_doctor_command_ok(tmp_path, monkeypatch, capsys):
     assert "[OK] config" in out
     assert "[OK] database" in out
     assert "[SKIP] llm_chat" in out
-    assert "summary: 13 probes: " in out
+    assert "summary: 14 probes: " in out
 
 
 def test_doctor_command_fail_exits_1(tmp_path, monkeypatch, capsys):

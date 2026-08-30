@@ -135,6 +135,7 @@ class GateContext(Protocol):
     last_message: Message | None
     self_name: str | None
     self_aliases: tuple[str, ...]
+    muted: bool
     has_direct_at: bool
     has_quote_to_self: bool
     has_other_assistant: bool

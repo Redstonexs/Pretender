@@ -132,7 +132,12 @@ class OutputPipeline:
         from pretender.output.typo import TypoStage
 
         self.register(SanitizeStage(max_length=self.config.max_length))
-        self.register(SplitStage(max_split=self.config.max_split))
+        self.register(
+            SplitStage(
+                max_split=self.config.max_split,
+                typing_speed=self.config.typing_speed,
+            )
+        )
         self.register(
             TypoStage(
                 typo_rate=self.config.typo_rate,

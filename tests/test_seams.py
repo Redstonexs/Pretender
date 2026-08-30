@@ -569,7 +569,7 @@ def test_gate_context_exposes_all_frozen_evaluation_facts():
     # Every fact a GateFeature may read is a documented protocol attribute —
     # no feature needs undocumented concrete state or direct DB access.
     attrs = _protocol_members(GateContext)
-    assert len(attrs) == 33
+    assert len(attrs) == 34
     for name in (
         "chat_key", "cycle_id", "start_msg_id", "through_msg_id",
         "evaluated_ts", "self_id", "self_name",
@@ -581,6 +581,7 @@ def test_gate_context_exposes_all_frozen_evaluation_facts():
         "is_group", "is_focused", "last_message",
         "has_direct_at", "has_quote_to_self", "has_other_assistant",
         "hold_until", "idle_streak", "previous_end_reason",
+        "muted",
     ):
         assert name in attrs, f"GateContext must expose {name}"
 

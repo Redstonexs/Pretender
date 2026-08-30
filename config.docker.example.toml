@@ -7,6 +7,23 @@
 [bot]
 name = "麦麦"
 
+# Where the bot may speak at all. Prior to [gate]: a chat
+# excluded here is never replied to, not even when @-ed. It is
+# still read and learned from — the bot watches, it just does
+# not talk. mode is "blacklist" (listed chats silenced) or
+# "whitelist" (ONLY listed chats reply; empty allows nothing).
+# ids take the bare id ("123456") or the whole chat key.
+# 机器人在哪里可以说话。列表排除的会话永远不回复，但仍然会看和学习。
+[access.groups]
+enabled = true
+mode = "blacklist"
+ids = []
+
+[access.private]
+enabled = true
+mode = "blacklist"
+ids = []
+
 # When the bot speaks. A direct @ or a quote of its own message
 # ALWAYS replies and ignores everything below.
 #   trigger_score - the score needed to speak unprompted (0-100).
@@ -42,10 +59,23 @@ base_url = "https://opencode.ai/zen/v1"
 api_key = "${PRETENDER_LLM_API_KEY}"
 model = "ling-3.0-flash-fin-free"
 
+# Every learner run goes through this one profile. Learning is off
+# without it, no matter what [learn] says.
+# 所有学习器都走这个 profile；没有它 [learn] 等于没开。
+[llm.profiles.learn]
+base_url = "https://opencode.ai/zen/v1"
+api_key = "${PRETENDER_LLM_API_KEY}"
+model = "ling-3.0-flash-fin-free"
+
+# How the reply is turned into messages. typing_speed paces the
+# extra bubbles by how long a person would take to type them,
+# so a two-character reply lands fast and a long one does not.
+# 0 sends everything at once, 1 is human, 2 is slow.
 [output]
 pipeline = ["sanitize", "split", "typo"]
 max_split = 3
 typo_rate = 0.01
+typing_speed = 1.0
 
 # No vision profile: this provider serves no model that accepts
 # image input, so incoming images cannot be described and
@@ -64,10 +94,12 @@ typo_rate = 0.01
 # model = ...
 
 # Learn how this group actually talks: expression style, slang,
-# behaviour patterns, conversation summaries, and whether the
-# references shown to the planner were actually used.
-# Without this the reply style is frozen at "自然" forever.
-# 学习这个群的说话方式；关掉的话回复风格永远是"自然"。
+# behaviour patterns, conversation summaries, impressions of the
+# people here, and whether the references shown to the planner
+# were actually used.
+# Without this the reply style is frozen at "自然" forever and
+# the bot never remembers who anyone is.
+# 学习这个群的说话方式和群友的为人；关掉的话回复风格永远是"自然"。
 [learn]
 enabled = true
 cadence_s = 3600
@@ -79,6 +111,9 @@ cadence_s = 1800
 cadence_s = 3600
 
 [learn.profiles.jargon]
+cadence_s = 3600
+
+[learn.profiles.impression]
 cadence_s = 3600
 
 [learn.profiles.summary]

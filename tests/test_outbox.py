@@ -373,3 +373,55 @@ def test_pump_forwards_delivery_key_through_transport_metadata():
 
     sent = run(scenario())
     assert sent == [("hi", "cy-1:0"), ("part2", "cy-1:1")]
+
+
+# ── [access] mute: nothing queued leaks past a new mute ─────────────────────
+
+
+def test_a_muted_chat_sends_nothing(tmp_path):
+    """The gate refuses to PLAN a reply for a muted chat, but rows queued
+    before the mute took effect are still sitting there — and with
+    content-derived pacing a reply's later bubbles are scheduled seconds
+    ahead. Without this guard, "mute that group, restart" still delivers
+    parts 2 and 3."""
+    async def scenario():
+        _db, repo = await open_repo(tmp_path / "t.db")
+        await repo.upsert_chat(make_identity())
+        adapter = ConsoleAdapter(clock=VirtualClock())
+        driver = OutboxDriver(
+            repo, adapter, clock=VirtualClock(), muted=lambda key: key == CK
+        )
+        await finish_batch(
+            repo, driver.to_items(outgoing("queued before the mute"), "cy-1")
+        )
+        sent = await driver.pump(CK, now=100.0)
+        drained = await driver.drain(CK, now=100.0)
+        state = await repo._db.read(
+            lambda c: c.execute("SELECT state FROM outbox WHERE id = 1").fetchone()
+        )
+        await repo.close()
+        return sent, drained, state, len(adapter.sent)
+
+    sent, drained, state, sent_count = run(scenario())
+    assert sent == 0
+    assert drained == 0
+    assert sent_count == 0
+    # Left PENDING, never cancelled: un-listing a chat is meant to be as
+    # reversible as listing it.
+    assert state == ("pending",)
+
+
+def test_an_unmuted_chat_is_unaffected_by_the_guard(tmp_path):
+    async def scenario():
+        _db, repo = await open_repo(tmp_path / "t.db")
+        await repo.upsert_chat(make_identity())
+        adapter = ConsoleAdapter(clock=VirtualClock())
+        driver = OutboxDriver(
+            repo, adapter, clock=VirtualClock(), muted=lambda key: False
+        )
+        await finish_batch(repo, driver.to_items(outgoing("allowed"), "cy-1"))
+        sent = await driver.pump(CK, now=100.0)
+        await repo.close()
+        return sent, len(adapter.sent)
+
+    assert run(scenario()) == (1, 1)

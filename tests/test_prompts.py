@@ -23,6 +23,16 @@ def test_package_default_identity_exists():
     assert "群聊里的普通成员" in text
 
 
+def test_package_default_behavior_tells_the_planner_when_to_stay_quiet():
+    """MaiBot's ``behavior_style``: the planner's job is deciding WHETHER to
+    speak, so its half of the persona is about joining in and shutting up —
+    not about phrasing."""
+    store = PromptStore()
+    text = store.load_identity("prompts/behavior.txt")
+    assert "什么时候开口" in text
+    assert "不要硬找话题" in text
+
+
 # ── load_identity (bot.identity_file) ────────────────────────────────────────
 
 def test_load_identity_default_path_resolves_package():
@@ -177,9 +187,15 @@ PHASE3_ASSETS = ("planner.txt", "planner_focus.txt", "replyer.txt")
 
 # The {{var}} set each Phase 3 asset declares (must match the file exactly).
 PHASE3_VARS = {
-    "planner.txt": ("identity", "chat_log", "reply_style", "bot_name", "drift_block"),
+    "planner.txt": (
+        "behavior_style",
+        "chat_log",
+        "reply_style",
+        "bot_name",
+        "drift_block",
+    ),
     "planner_focus.txt": (
-        "identity",
+        "behavior_style",
         "chat_log",
         "reply_style",
         "focus_chat",

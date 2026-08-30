@@ -157,7 +157,6 @@ def test_reply_exit_legal_transcript():
     result = run(
         planner.plan(
             [TranscriptMessage(role="user", content="在吗")],
-            identity="你是麦麦",
             chat_log="小明: 在吗",
             reply_style="自然",
         )
@@ -190,7 +189,7 @@ def test_wait_exit():
     ]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.WAIT
     assert result.wait_seconds == 30
@@ -208,7 +207,7 @@ def test_no_action_exit():
     ]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.NO_ACTION
     assert result.end_reason == "no_action"
@@ -220,7 +219,7 @@ def test_no_tool_call_degrades_to_no_action():
     script = [LLMResponse(content="我分析了一下，没什么好说的", tool_calls=())]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.NO_ACTION
     assert result.end_reason == "no_tool_call"
@@ -234,7 +233,7 @@ def test_empty_response_degrades_to_no_action():
     script = [LLMResponse(content=None, tool_calls=())]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.NO_ACTION
     assert result.end_reason == "empty_response"
@@ -257,7 +256,7 @@ def test_multi_round_tool_search_then_reply():
     ]
     planner, llm, registry = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.REPLY
     assert result.reply_reference == "好"
@@ -283,7 +282,7 @@ def test_tool_loop_cap():
     ]
     planner, llm, _ = make_planner(script, max_tool_rounds=3)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.NO_ACTION
     assert result.end_reason == "tool_round_cap"
@@ -306,7 +305,7 @@ def test_malformed_tool_json_fallback_reply():
     ]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.REPLY
     assert result.reply_reference == "你好"
@@ -331,7 +330,7 @@ def test_fuzzed_calls_all_answered():
     ]
     planner, _, _ = make_planner(script)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     # call_1 staged a reply → terminal REPLY; every id still answered.
     assert result.intent == PlanIntent.REPLY
@@ -357,7 +356,7 @@ def test_repair_callback_invoked_once():
     script = [LLMResponse(content="no json block here", tool_calls=())]
     planner, _, _ = make_planner(script, repair=repair)
     result = run(
-        planner.plan([], identity="x", chat_log="", reply_style="y")
+        planner.plan([], chat_log="", reply_style="y")
     )
     assert result.intent == PlanIntent.NO_ACTION
     assert result.end_reason == "no_action"
@@ -395,7 +394,7 @@ def test_raising_handler_is_contained():
         cc,
         tool_context_factory=lambda: make_ctx(registry),
     )
-    result = run(planner.plan([], identity="x", chat_log="", reply_style="y"))
+    result = run(planner.plan([], chat_log="", reply_style="y"))
     # dispatch_call itself contains the handler exception → ok=False result.
     assert result.tool_results[0].ok is False
     assert "kaboom" in (result.tool_results[0].error or "")
@@ -418,7 +417,7 @@ def test_dispatch_call_raising_is_contained(monkeypatch):
         LLMResponse(content=None, tool_calls=()),
     ]
     planner, _, _ = make_planner(script)
-    result = run(planner.plan([], identity="x", chat_log="", reply_style="y"))
+    result = run(planner.plan([], chat_log="", reply_style="y"))
     # The planner's own containment boundary turns the raising dispatch into
     # an ok=False result; the id is still answered and the loop degrades to
     # no_action rather than raising.
@@ -447,7 +446,7 @@ def test_usage_aggregation():
         ),
     ]
     planner, _, _ = make_planner(script)
-    result = run(planner.plan([], identity="x", chat_log="", reply_style="y"))
+    result = run(planner.plan([], chat_log="", reply_style="y"))
     assert result.usage == {
         "prompt_tokens": 17,
         "completion_tokens": 8,
@@ -472,14 +471,15 @@ def test_prompt_rendering_and_focus_selection():
     run(
         planner.plan(
             [],
-            identity="测试身份",
             chat_log="小明: 你好",
             reply_style="活泼",
+            behavior_style="测试行为风格",
         )
     )
     system = llm.calls[0][0][0]
     assert system.role == "system"
-    assert "测试身份" in system.content
+    # The planner gets the persona's ACTION rules, not the replyer identity.
+    assert "测试行为风格" in system.content
     assert "小明: 你好" in system.content
     assert "活泼" in system.content
     assert "当前聚焦的聊天" not in system.content
@@ -487,7 +487,6 @@ def test_prompt_rendering_and_focus_selection():
     run(
         planner.plan(
             [],
-            identity="测试身份",
             chat_log="小明: 你好",
             reply_style="活泼",
             focus_chat="群A",
@@ -544,7 +543,7 @@ def test_injected_tool_context_is_reused():
         )
     ]
     planner, _, _ = make_planner(script, injected_ctx=ctx)
-    result = run(planner.plan([], identity="x", chat_log="", reply_style="y"))
+    result = run(planner.plan([], chat_log="", reply_style="y"))
     assert result.intent == PlanIntent.REPLY
     assert result.reply_reference == "hi"
     assert ctx.reply_text == "hi"  # the injected context carried the verdict
@@ -558,7 +557,7 @@ def test_plan_result_is_immutable_typed():
         )
     ]
     planner, _, _ = make_planner(script)
-    result = run(planner.plan([], identity="x", chat_log="", reply_style="y"))
+    result = run(planner.plan([], chat_log="", reply_style="y"))
     assert isinstance(result.rounds, tuple)
     assert isinstance(result.transcript, tuple)
     assert isinstance(result.tool_results, tuple)

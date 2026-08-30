@@ -502,6 +502,23 @@ def render_config(
             "[bot]",
             f"name = {toml_string(DEFAULT_BOT_NAME, 'bot name')}",
             "",
+            "# Where the bot may speak at all. Prior to [gate]: a chat",
+            "# excluded here is never replied to, not even when @-ed. It is",
+            "# still read and learned from — the bot watches, it just does",
+            "# not talk. mode is \"blacklist\" (listed chats silenced) or",
+            "# \"whitelist\" (ONLY listed chats reply; empty allows nothing).",
+            "# ids take the bare id (\"123456\") or the whole chat key.",
+            "# 机器人在哪里可以说话。列表排除的会话永远不回复，但仍然会看和学习。",
+            "[access.groups]",
+            "enabled = true",
+            'mode = "blacklist"',
+            "ids = []",
+            "",
+            "[access.private]",
+            "enabled = true",
+            'mode = "blacklist"',
+            "ids = []",
+            "",
             "# When the bot speaks. A direct @ or a quote of its own message",
             "# ALWAYS replies and ignores everything below.",
             "#   trigger_score - the score needed to speak unprompted (0-100).",
@@ -537,18 +554,26 @@ def render_config(
             f"api_key = \"${{{LLM_ENV}}}\"",
             f"model = {toml_string(reply, 'reply model')}",
             "",
+            *_learn_profile_section(base_url, planner, features.learning),
+            "# How the reply is turned into messages. typing_speed paces the",
+            "# extra bubbles by how long a person would take to type them,",
+            "# so a two-character reply lands fast and a long one does not.",
+            "# 0 sends everything at once, 1 is human, 2 is slow.",
             "[output]",
             f"pipeline = {pipeline_toml}",
             f"max_split = {max_split}",
             f"typo_rate = {typo_rate}",
+            "typing_speed = 1.0",
             "",
             *_vision_section(base_url, vision),
             *_embed_section(base_url, embed),
             "# Learn how this group actually talks: expression style, slang,",
-            "# behaviour patterns, conversation summaries, and whether the",
-            "# references shown to the planner were actually used.",
-            "# Without this the reply style is frozen at \"自然\" forever.",
-            "# 学习这个群的说话方式；关掉的话回复风格永远是\"自然\"。",
+            "# behaviour patterns, conversation summaries, impressions of the",
+            "# people here, and whether the references shown to the planner",
+            "# were actually used.",
+            "# Without this the reply style is frozen at \"自然\" forever and",
+            "# the bot never remembers who anyone is.",
+            "# 学习这个群的说话方式和群友的为人；关掉的话回复风格永远是\"自然\"。",
             "[learn]",
             f"enabled = {str(features.learning).lower()}",
             "cadence_s = 3600",
@@ -647,9 +672,31 @@ _LEARN_PROFILES = (
     ("expression", 1800),
     ("behavior", 3600),
     ("jargon", 3600),
+    ("impression", 3600),
     ("summary", 7200),
     ("effect", 7200),
 )
+
+
+def _learn_profile_section(base_url: str, model: str, enabled: bool) -> list[str]:
+    """The ONE provider profile every learner run calls.
+
+    Without it each run dies on ``no LLM profile named 'learn'``, the
+    watermark never advances, and the adaptive layer produces nothing at all
+    while ``[learn] enabled = true`` makes it look switched on.
+    """
+    if not enabled:
+        return []
+    return [
+        "# Every learner run goes through this one profile. Learning is off",
+        "# without it, no matter what [learn] says.",
+        "# 所有学习器都走这个 profile；没有它 [learn] 等于没开。",
+        "[llm.profiles.learn]",
+        f"base_url = {toml_string(base_url, 'base URL')}",
+        f"api_key = \"${{{LLM_ENV}}}\"",
+        f"model = {toml_string(model, 'learn model')}",
+        "",
+    ]
 
 
 def _learn_profiles(enabled: bool) -> list[str]:

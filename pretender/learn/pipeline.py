@@ -44,7 +44,11 @@ from pretender.budget import BudgetDecision, BudgetManager, BudgetUsage
 from pretender.clock import Clock
 from pretender.errors import PromptError
 from pretender.learn.parse import LearnerParseError, parse_json_response
-from pretender.learn.render import render_batch, source_hash
+from pretender.learn.render import (
+    render_attributed_batch,
+    render_batch,
+    source_hash,
+)
 from pretender.learn.specs import LearnerValidationError, Validator
 from pretender.prompts import PromptStore
 from pretender.seams import AdaptiveRepository, LLMClient
@@ -428,13 +432,16 @@ class LearnerPipeline:
         """Render the spec's prompt file with the opaque-ref batch surface.
 
         The prompt template receives ``{{messages}}`` (the escaped opaque-ref
-        message list), ``{{learner}}``, ``{{chat_key}}``, ``{{count}}`` and
-        ``{{references}}`` (the effect learner's reference surface). A
-        missing variable raises ``PromptError`` (fail closed).
+        message list), ``{{attributed_messages}}`` (the same list with each
+        speaker's display name, which only the impression learner needs),
+        ``{{learner}}``, ``{{chat_key}}``, ``{{count}}`` and ``{{references}}``
+        (the effect learner's reference surface). A missing variable raises
+        ``PromptError`` (fail closed).
         """
         return self._prompts.render(
             spec.prompt,
             messages=render_batch(batch),
+            attributed_messages=render_attributed_batch(batch),
             learner=spec.name,
             chat_key=str(batch.chat_key),
             count=len(batch.texts),
